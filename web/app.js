@@ -101,6 +101,7 @@ function createWebSocketBridge(url) {
       };
       socket.onclose = () => {
         ready = false;
+        readyNotified = false;
         if (!manualClose) {
           connect(500);
         }
@@ -210,6 +211,7 @@ function createHttpBridge(baseUrl) {
         } catch (err) {
           // ignore
         }
+        readyNotified = false;
         if (!manualClose) {
           connect(1000);
         }
@@ -293,6 +295,7 @@ function closeBridgeConnection() {
   bridgeConnection = null;
   bridgeReceiver = null;
   pendingBridgeMessages = [];
+  readyNotified = false;
 }
 
 function setBridgeReceiver(handler) {

@@ -71,22 +71,30 @@ Presentation JS (web/app.js)
 
 ## 実行方法
 
+### 親プロセスだけで起動する（通常運用）
+
 ```bash
-# 低レイテンシな WebSocket ブリッジ（既定）
-python app/main.py --bridge ws
-
-# HTTP + SSE ブリッジを試す場合
-python app/main.py --bridge http
-
-# ポートを固定したい場合（例: 8765 番）
-python app/main.py --bridge ws --port 8765
+python app/main.py --bridge ws --debug
 ```
 
-- `--bridge` を省略すると WebSocket 方式で起動します。HTTP モードでは `EventSource` によるサーバープッシュを使用するため、一部のセキュリティ製品でブロックされる場合があります。
-- `--port` を指定しない場合は、利用可能なポートが自動で割り当てられます。特定のポートを開放済みで固定運用したい場合にだけ明示的に指定してください。
-- Windows で WebView2 ランタイムが未導入の場合は Microsoft Edge WebView2 ランタイムをインストールしてください。`PYWEBVIEW_GUI=edgechromium` を指定すると Edge バックエンドを強制できます。
-- `python app/main.py --debug` または `DEBUG=1 python app/main.py` を指定すると、起動から 30 秒間はブリッジ接続やイベントの詳細ログを INFO レベルに出力します。子プロセス側で `--debug` を付与（親から自動で継承）すると、プレゼン側でもバックエンド名や `index.html` の絶対パスを記録します。
-- VOICEVOX エンジンが起動していない状態で開始しても、アプリは 10 秒間隔でサービスの再検出を行います。後から VOICEVOX を立ち上げた場合でも再度「開始」を押せば接続できます。
+- `--bridge` を省略すると WebSocket ブリッジが選択されます。HTTP + SSE を試す場合は `--bridge http` を指定してください。
+- `--port` を省略すると、未使用のポートを自動で割り当てます。ファイアウォール設定済みのポートを使う場合のみ明示的に指定します（例: `--port 8765`）。
+- `--debug` または環境変数 `DEBUG=1` を指定すると、起動から 30 秒間は親プロセスが WebSocket 接続のリトライ間隔や割り当てポートを、子プロセスが GUI バックエンドと `index.html` の絶対 URL、`WS listening on ws://...` といった診断ログを INFO レベルで出力します。
+- Windows では Microsoft Edge WebView2 ランタイムが必須です。`PYWEBVIEW_GUI=edgechromium` を設定すると Edge バックエンドを強制できます。
+- VOICEVOX エンジンが未起動でも 10 秒間隔で再検出します。後からエンジンを立ち上げた場合は、コントロール画面で「開始」を押し直せば音声が再取得されます。
+
+### プロセスを分けてデバッグする場合
+
+```bash
+# 先にプレゼンプロセスを起動
+python app/presenter.py --bridge ws --port 8765 --debug
+
+# 続いてコントロールを同じブリッジ・ポートで起動
+python app/main.py --bridge ws --port 8765 --debug
+```
+
+- HTTP + SSE フォールバックでは `--bridge http` を両方に指定してください（CORS と OPTIONS 応答は既に有効です）。
+- `ブリッジ` ラベルが「接続中」になってから `READY` イベントが届くと、現在選択中の問題・設定が自動的に再同期されます。切断時は「未接続」に戻り、再接続後に音声プリフェッチが再実行されます。
 
 - **コントロール画面**（Tkinter）と **プレゼン画面**（pywebview）の 2 つのウィンドウが開きます。
 - 初期状態では `samples/sample.quiz.txt` を読み込みます。別ファイルを利用する場合は「クイズを開く」ボタンから選択してください。
@@ -109,7 +117,7 @@ python app/main.py --bridge ws --port 8765
 - **ズーム**: プレゼン画面全体の拡大率（0.85–1.40）。
 - **コンパクト表示**: 見出し領域の表示/非表示を切り替えます。
 
-ステータスエリアでは、現在のページ番号、進行中フレーズ、TTS キュー残数、VOICEVOX の起動状態を確認できます。
+ステータスエリアでは、ブリッジ接続状態、現在のページ番号、進行中フレーズ、TTS キュー残数、VOICEVOX の起動状態を確認できます。
 
 ### プレゼン画面の仕様
 
@@ -151,9 +159,11 @@ EXPLAIN:
 | ---- | ---- |
 | VOICEVOX が未起動で音声が出ない | コントロール画面のステータスが「未起動」のままになります。エンジン起動後に再度「開始」を押すと音声が流れます。警告は初回のみ表示され、以後は無音で進行します。 |
 | プレゼン画面が真っ白 | `web/index.html` が読み込めていない可能性があります。`python app/main.py` をプロジェクトルートで実行しているか確認してください。 |
+| RuntimeError: main thread is not in main loop / no running event loop | 最新の 2 プロセス構成では、子プロセス内で専用の asyncio ループを立ち上げています。旧バージョンの `presenter.py` が残っていないか確認し、`WS listening on ws://...` ログが出ているかを `--debug` 付きで確認してください。ポート競合でも同様のエラーになるため、未使用ポートに変更するか、既存プロセスを終了します。 |
+| 接続拒否（WinError 1225 など）で「未接続」から回復しない | `app/presenter.py` が指定ポートで待ち受けているか確認し、ファイアウォールに `127.0.0.1:<ポート>` への WebSocket/HTTP 通信を許可してください。`--debug` で「WebSocket bridge connected/disconnected」のログが循環している場合は、ポートやブリッジ方式を見直します。 |
 | WebAudio が再生されない | ブラウザコンテキストがサスペンドされた場合があります。タイプライタ開始や再開を行うと AudioContext が自動的に `resume()` されます。 |
 | 長文が収まらない | 自動縮小とスクロールが働かない場合は、問題文を句読点で分割するなど調整してください。 |
-| READY が届かずコントロールに「未接続」と表示される | ファイアウォールで `127.0.0.1:<動的ポート>` への WebSocket / HTTP 通信が遮断されていないか確認してください。HTTP ブリッジの場合は `http://127.0.0.1:<ポート>/api/presentation/events` への EventSource が許可されている必要があります。 |
+| READY が届かずコントロールに「未接続」と表示される | ファイアウォールで `127.0.0.1:<動的ポート>` への WebSocket / HTTP 通信が遮断されていないか確認してください。HTTP ブリッジの場合は `http://127.0.0.1:<ポート>/api/presentation/events` への EventSource が許可されている必要があります。接続が復旧すると `ブリッジ` ラベルが「接続中」に戻り、自動的に `READY` が再送されます。 |
 
 ## ライセンス
 

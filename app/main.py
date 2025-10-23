@@ -307,14 +307,16 @@ class BridgeClientBase:
 
 
 class WebSocketBridgeClient(BridgeClientBase):
-    def __init__(self, host: str, port: int, callback: Callable[[Dict], None]) -> None:
+    def __init__(self, host: str, port: int, callback: Callable[[Dict], None], *, debug: bool = False) -> None:
         self.host = host
         self.port = port
         self.callback = callback
+        self.debug = debug
         self.loop = None
         self.thread: Optional[threading.Thread] = None
         self.stop_event = threading.Event()
         self.out_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        self.connected = False
 
     def start(self) -> None:
         import asyncio
@@ -328,8 +330,14 @@ class WebSocketBridgeClient(BridgeClientBase):
                 uri = f"ws://{self.host}:{self.port}/control"
                 backoff = 0.5
                 while not self.stop_event.is_set():
+                    if self.debug:
+                        logging.debug("Connecting to bridge %s (backoff %.1fs)", uri, backoff)
                     try:
                         async with websockets.connect(uri) as websocket:
+                            if not self.connected:
+                                logging.info("WebSocket bridge connected: %s", uri)
+                                self.connected = True
+                                self.callback({"action": "BRIDGE_CONNECTED", "data": {"mode": BRIDGE_WS}})
                             backoff = 0.5
                             receiver = asyncio.create_task(self._receiver(websocket))
                             sender = asyncio.create_task(self._sender(websocket))
@@ -343,13 +351,25 @@ class WebSocketBridgeClient(BridgeClientBase):
                                 if task.exception():
                                     raise task.exception()
                     except Exception as exc:  # pylint: disable=broad-except
-                        logging.debug("WebSocket reconnect required: %s", exc)
+                        if self.connected:
+                            logging.info("WebSocket bridge disconnected: %s", exc)
+                            self.connected = False
+                            self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_WS}})
+                        if self.stop_event.is_set():
+                            break
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 5)
+                if self.connected:
+                    self.connected = False
+                    self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_WS}})
 
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            self.loop.run_until_complete(connect_loop())
+            try:
+                self.loop.run_until_complete(connect_loop())
+            finally:
+                self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+                self.loop.close()
 
         self.thread = threading.Thread(target=runner, name="WebSocketBridge", daemon=True)
         self.thread.start()
@@ -390,12 +410,29 @@ class WebSocketBridgeClient(BridgeClientBase):
 
 
 class EventStreamReader(threading.Thread):
-    def __init__(self, session: requests.Session, url: str, callback: Callable[[Dict], None], stop_event: threading.Event) -> None:
+    def __init__(
+        self,
+        session: requests.Session,
+        url: str,
+        callback: Callable[[Dict], None],
+        stop_event: threading.Event,
+        status_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         super().__init__(name="SSEReader", daemon=True)
         self.session = session
         self.url = url
         self.callback = callback
         self.stop_event = stop_event
+        self.status_callback = status_callback
+        self._connected = False
+
+    def _notify(self, status: str) -> None:
+        if not self.status_callback:
+            return
+        try:
+            self.status_callback(status)
+        except Exception:  # pylint: disable=broad-except
+            logging.debug("SSE status callback failed for %s", status)
 
     def run(self) -> None:  # type: ignore[override]
         while not self.stop_event.is_set():
@@ -404,6 +441,9 @@ class EventStreamReader(threading.Thread):
                     if response.status_code != 200:
                         time.sleep(1)
                         continue
+                    if not self._connected:
+                        self._connected = True
+                        self._notify("connected")
                     buffer = ""
                     for raw in response.iter_lines(decode_unicode=True):
                         if self.stop_event.is_set():
@@ -424,6 +464,10 @@ class EventStreamReader(threading.Thread):
             except requests.RequestException as exc:
                 logging.debug("SSE reconnect due to %s", exc)
                 time.sleep(1)
+            finally:
+                if self._connected:
+                    self._connected = False
+                    self._notify("disconnected")
 
 
 class HttpBridgeClient(BridgeClientBase):
@@ -434,6 +478,7 @@ class HttpBridgeClient(BridgeClientBase):
         self.session = requests.Session()
         self.stop_event = threading.Event()
         self.reader: Optional[EventStreamReader] = None
+        self.connected = False
 
     @property
     def base_url(self) -> str:
@@ -443,8 +488,22 @@ class HttpBridgeClient(BridgeClientBase):
         if self.reader:
             return
         events_url = f"{self.base_url}/api/events"
-        self.reader = EventStreamReader(self.session, events_url, self.callback, self.stop_event)
+        self.reader = EventStreamReader(
+            self.session,
+            events_url,
+            self.callback,
+            self.stop_event,
+            status_callback=self._handle_status,
+        )
         self.reader.start()
+
+    def _handle_status(self, status: str) -> None:
+        if status == "connected" and not self.connected:
+            self.connected = True
+            self.callback({"action": "BRIDGE_CONNECTED", "data": {"mode": BRIDGE_HTTP}})
+        elif status == "disconnected" and self.connected:
+            self.connected = False
+            self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_HTTP}})
 
     def send(self, action: str, data: Optional[Dict] = None) -> None:
         payload = {"action": action, "data": data or {}}
@@ -458,6 +517,9 @@ class HttpBridgeClient(BridgeClientBase):
         self.stop_event.set()
         if self.reader and self.reader.is_alive():
             self.reader.join(timeout=1)
+        if self.connected:
+            self.connected = False
+            self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_HTTP}})
 
 
 def find_free_port() -> int:
@@ -476,20 +538,25 @@ class PresenterProcess:
         self.port = port or find_free_port()
         self.process: Optional[subprocess.Popen] = None
         self.bridge: Optional[BridgeClientBase] = None
+        self._stopping = False
+        self._monitor: Optional[threading.Thread] = None
 
     def start(self) -> None:
         script_path = Path(__file__).with_name("presenter.py")
-        debug_flag = "--debug" if self.debug else ""
+        self._stopping = False
         env = os.environ.copy()
         args = [sys.executable, str(script_path), "--bridge", self.mode, "--port", str(self.port)]
         if self.debug:
             args.append("--debug")
         self.process = subprocess.Popen(args, env=env)
         if self.mode == BRIDGE_WS:
-            self.bridge = WebSocketBridgeClient("127.0.0.1", self.port, self.on_event)
+            self.bridge = WebSocketBridgeClient("127.0.0.1", self.port, self.on_event, debug=self.debug)
         else:
             self.bridge = HttpBridgeClient("127.0.0.1", self.port, self.on_event)
         self.bridge.start()
+        if not self._monitor:
+            self._monitor = threading.Thread(target=self._watch_process, name="PresenterMonitor", daemon=True)
+            self._monitor.start()
 
     def send(self, action: str, data: Optional[Dict] = None) -> None:
         if not self.bridge:
@@ -497,6 +564,7 @@ class PresenterProcess:
         self.bridge.send(action, data)
 
     def stop(self) -> None:
+        self._stopping = True
         if self.bridge:
             try:
                 self.bridge.send("QUIT", {})
@@ -509,6 +577,18 @@ class PresenterProcess:
                 self.process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+
+    def _watch_process(self) -> None:
+        try:
+            if not self.process:
+                return
+            returncode = self.process.wait()
+            if self._stopping:
+                return
+            if returncode not in (0, None):
+                self.on_event({"action": "PRESENTER_EXITED", "data": {"returncode": returncode}})
+        finally:
+            self._monitor = None
 
 
 class QuizApp:
@@ -540,6 +620,7 @@ class QuizApp:
         self.phrase_var = tk.StringVar(value="-")
         self.queue_var = tk.StringVar(value="0")
         self.voicevox_var = tk.StringVar(value="未確認")
+        self.bridge_var = tk.StringVar(value="未接続")
         self.answer_text = tk.StringVar(value="")
         self.questions_listbox: Optional[tk.Listbox] = None
         self.presentation_ready = False
@@ -617,14 +698,16 @@ class QuizApp:
         status_frame = ttk.LabelFrame(right, text="状態")
         status_frame.pack(fill=tk.X)
 
-        ttk.Label(status_frame, text="ページ").grid(row=0, column=0, sticky=tk.W)
-        ttk.Label(status_frame, textvariable=self.page_var).grid(row=0, column=1, sticky=tk.W)
-        ttk.Label(status_frame, text="フレーズ").grid(row=1, column=0, sticky=tk.W)
-        ttk.Label(status_frame, textvariable=self.phrase_var).grid(row=1, column=1, sticky=tk.W)
-        ttk.Label(status_frame, text="TTSキュー").grid(row=2, column=0, sticky=tk.W)
-        ttk.Label(status_frame, textvariable=self.queue_var).grid(row=2, column=1, sticky=tk.W)
-        ttk.Label(status_frame, text="VOICEVOX").grid(row=3, column=0, sticky=tk.W)
-        ttk.Label(status_frame, textvariable=self.voicevox_var).grid(row=3, column=1, sticky=tk.W)
+        ttk.Label(status_frame, text="ブリッジ").grid(row=0, column=0, sticky=tk.W)
+        ttk.Label(status_frame, textvariable=self.bridge_var).grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(status_frame, text="ページ").grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(status_frame, textvariable=self.page_var).grid(row=1, column=1, sticky=tk.W)
+        ttk.Label(status_frame, text="フレーズ").grid(row=2, column=0, sticky=tk.W)
+        ttk.Label(status_frame, textvariable=self.phrase_var).grid(row=2, column=1, sticky=tk.W)
+        ttk.Label(status_frame, text="TTSキュー").grid(row=3, column=0, sticky=tk.W)
+        ttk.Label(status_frame, textvariable=self.queue_var).grid(row=3, column=1, sticky=tk.W)
+        ttk.Label(status_frame, text="VOICEVOX").grid(row=4, column=0, sticky=tk.W)
+        ttk.Label(status_frame, textvariable=self.voicevox_var).grid(row=4, column=1, sticky=tk.W)
 
         answer_frame = ttk.LabelFrame(right, text="正解")
         answer_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
@@ -656,6 +739,20 @@ class QuizApp:
             messagebox.showinfo("情報", "プレゼンテーションが終了しました。")
         elif event == "PONG":
             pass
+        elif event == "BRIDGE_CONNECTED":
+            self.bridge_var.set("接続中")
+        elif event == "BRIDGE_DISCONNECTED":
+            self.bridge_var.set("未接続")
+            self.presentation_ready = False
+            self.voicevox_var.set("未確認")
+            self.voicevox_alerted = False
+        elif event == "PRESENTER_EXITED":
+            self.bridge_var.set("停止")
+            self.presentation_ready = False
+            if payload and not self.closing:
+                code = payload.get("returncode")
+                if code not in (0, None):
+                    messagebox.showerror("プレゼン停止", f"プレゼンテーションプロセスが終了しました (code={code})")
         elif event == "VOICEVOX_UNAVAILABLE":
             if self.voicevox_alerted:
                 messagebox.showwarning("VOICEVOX", "VOICEVOX が起動していない可能性があります。")
@@ -664,6 +761,7 @@ class QuizApp:
         if self.presentation_ready:
             return
         self.presentation_ready = True
+        self.bridge_var.set("接続中")
         available = self.tts_manager.check_service()
         if available:
             self.voicevox_var.set("起動中")

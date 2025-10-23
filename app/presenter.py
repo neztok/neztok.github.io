@@ -1,8 +1,10 @@
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -53,7 +55,7 @@ class WebSocketBridgeServer(BridgeServerBase):
         self.host = host
         self.port = port
         self.debug = debug
-        self.loop = asyncio.new_event_loop()
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.thread: Optional[threading.Thread] = None
         self.server = None
         self.control_conn = None
@@ -62,6 +64,8 @@ class WebSocketBridgeServer(BridgeServerBase):
         self.pending_to_presentation: List[str] = []
         self.ready_event = threading.Event()
         self.stop_event = threading.Event()
+        self.start_exception: Optional[BaseException] = None
+        self._stop_future: Optional[asyncio.Future] = None
 
     def start(self) -> None:
         import websockets
@@ -69,24 +73,57 @@ class WebSocketBridgeServer(BridgeServerBase):
         if self.thread:
             return
 
-        async def handler(websocket, path):  # type: ignore
-            if path == "/control":
-                await self._handle_control(websocket)
-            else:
-                await self._handle_presentation(websocket)
-
         def runner() -> None:
-            asyncio.set_event_loop(self.loop)
-            self.server = self.loop.run_until_complete(websockets.serve(handler, self.host, self.port))
-            self.ready_event.set()
+            loop = asyncio.new_event_loop()
+            self.loop = loop
+            asyncio.set_event_loop(loop)
+
+            async def handler(websocket, path):  # type: ignore
+                peer = "control" if path == "/control" else "presentation"
+                logging.info("WebSocket client connected: %s", peer)
+                try:
+                    if path == "/control":
+                        await self._handle_control(websocket)
+                    else:
+                        await self._handle_presentation(websocket)
+                finally:
+                    logging.info("WebSocket client disconnected: %s", peer)
+
+            async def ws_main() -> None:
+                try:
+                    async with websockets.serve(handler, self.host, self.port) as server:
+                        self.server = server
+                        logging.info("WebSocket bridge listening on ws://%s:%d", self.host, self.port)
+                        self._stop_future = asyncio.get_running_loop().create_future()
+                        self.ready_event.set()
+                        await self._stop_future
+                except Exception as exc:  # pylint: disable=broad-except
+                    self.start_exception = exc
+                    if isinstance(exc, OSError):
+                        logging.error("WebSocket bridge failed to bind %s:%d: %s", self.host, self.port, exc)
+                    else:
+                        logging.error("WebSocket bridge stopped unexpectedly: %s", exc)
+                    if not self.ready_event.is_set():
+                        self.ready_event.set()
+                finally:
+                    await self._close_all()
+
             try:
-                self.loop.run_forever()
+                loop.run_until_complete(ws_main())
             finally:
-                self.loop.run_until_complete(self._close_all())
+                pending = asyncio.all_tasks(loop)
+                for task in pending:
+                    task.cancel()
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                loop.run_until_complete(loop.shutdown_asyncgens())
+                loop.close()
 
         self.thread = threading.Thread(target=runner, name="WSBridgeServer", daemon=True)
         self.thread.start()
         self.ready_event.wait()
+        if self.start_exception:
+            raise RuntimeError("WebSocket bridge failed to start") from self.start_exception
 
     async def _close_all(self) -> None:
         if self.server:
@@ -94,10 +131,8 @@ class WebSocketBridgeServer(BridgeServerBase):
             await self.server.wait_closed()
         for conn in [self.control_conn, self.presentation_conn]:
             if conn:
-                try:
+                with contextlib.suppress(Exception):
                     await conn.close()
-                except Exception:  # pylint: disable=broad-except
-                    pass
 
     async def _handle_control(self, websocket) -> None:
         import websockets
@@ -154,26 +189,30 @@ class WebSocketBridgeServer(BridgeServerBase):
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self.loop.is_running():
-            self.loop.call_soon_threadsafe(self.loop.stop)
+        if self.loop and self._stop_future and not self._stop_future.done():
+            self.loop.call_soon_threadsafe(self._stop_future.set_result, None)
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=2)
 
     def send_to_control(self, payload: Dict) -> None:
+        if not self.loop or self.loop.is_closed() or self.start_exception:
+            return
         message = json.dumps(payload)
 
         async def _send() -> None:
             await self._forward_to_control(message)
 
-        self.loop.call_soon_threadsafe(asyncio.create_task, _send())
+        asyncio.run_coroutine_threadsafe(_send(), self.loop)
 
     def send_to_presentation(self, payload: Dict) -> None:
+        if not self.loop or self.loop.is_closed() or self.start_exception:
+            return
         message = json.dumps(payload)
 
         async def _send() -> None:
             await self._forward_to_presentation(message)
 
-        self.loop.call_soon_threadsafe(asyncio.create_task, _send())
+        asyncio.run_coroutine_threadsafe(_send(), self.loop)
 
 
 class HttpBridgeServer(BridgeServerBase):
@@ -305,6 +344,7 @@ class HttpBridgeServer(BridgeServerBase):
             self.loop.run_until_complete(self.runner.setup())
             self.site = web.TCPSite(self.runner, self.host, self.port)
             self.loop.run_until_complete(self.site.start())
+            logging.info("HTTP bridge listening on http://%s:%d", self.host, self.port)
             self.ready_event.set()
             try:
                 self.loop.run_forever()
@@ -358,7 +398,11 @@ class PresenterApp:
         self.window: Optional[webview.Window] = None
 
     def run(self) -> None:
-        self.server.start()
+        try:
+            self.server.start()
+        except RuntimeError as exc:
+            logging.error("Failed to start bridge server: %s", exc)
+            sys.exit(1)
         base_dir = Path(__file__).resolve().parent.parent
         index_path = base_dir / "web" / "index.html"
         index_uri = index_path.resolve().as_uri() + f"?mode={self.bridge_mode}&port={self.port}"
