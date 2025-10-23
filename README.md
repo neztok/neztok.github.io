@@ -18,7 +18,7 @@ requirements.txt  # 必要ライブラリ
 - Python 3.10 以上
 - VOICEVOX エンジン（ローカル API を `http://127.0.0.1:50021` で提供）
 - 音声出力が可能な環境（WebAudio を使用）
-- Windows / macOS / Linux で動作確認済み（pywebview の Tk バックエンドを使用）
+- Windows / macOS / Linux で動作確認済み。Windows では Microsoft Edge WebView2 ランタイム（pywebview の `edgechromium` バックエンド）を利用します。
 
 ## セットアップ
 
@@ -44,6 +44,9 @@ requirements.txt  # 必要ライブラリ
 ```bash
 python app/main.py
 ```
+
+- Windows で WebView2 ランタイムが未導入の場合は Microsoft Edge WebView2 ランタイムをインストールしてください。必要に応じて `PYWEBVIEW_GUI=edgechromium` を指定すると Edge バックエンドを強制できます。
+- 起動時に `python app/main.py --debug` や `DEBUG=1 python app/main.py` を利用すると、30 秒間イベントフローの詳細ログが INFO ログに混在して出力されます。
 
 - **コントロール画面**（Tkinter）と **プレゼン画面**（pywebview）の 2 つのウィンドウが開きます。
 - 初期状態では `samples/sample.quiz.txt` を読み込みます。別ファイルを利用する場合は「クイズを開く」ボタンから選択してください。

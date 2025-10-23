@@ -23,6 +23,7 @@ const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 
 let elements = {};
 let statusFrameToken = null;
+let readyNotified = false;
 
 function segmentGraphemes(text) {
   if (!segmenter) {
@@ -623,9 +624,12 @@ window.appBridge = {
 };
 
 function notifyReady() {
-  if (window.pywebview?.api?.notify_ready) {
-    window.pywebview.api.notify_ready().catch(() => {});
-  }
+  if (readyNotified) return;
+  if (!window.pywebview?.api?.notify_ready) return;
+  readyNotified = true;
+  window.pywebview.api.notify_ready().catch(() => {
+    readyNotified = false;
+  });
 }
 
 document.addEventListener('pywebviewready', notifyReady);

@@ -1,10 +1,13 @@
+import argparse
 import base64
 import json
 import logging
 import os
 import queue
 import re
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -228,6 +231,26 @@ def parse_quiz_file(path: str) -> List[QuizQuestion]:
     return questions
 
 
+def select_webview_gui() -> Optional[str]:
+    env_gui = os.environ.get("PYWEBVIEW_GUI")
+    if env_gui:
+        logging.info("Using pywebview GUI backend from PYWEBVIEW_GUI=%s", env_gui)
+        return env_gui
+    if sys.platform.startswith("win"):
+        try:
+            from webview.platforms import edgechromium  # type: ignore
+
+            if edgechromium.is_available():  # type: ignore[attr-defined]
+                logging.info("Detected Edge (WebView2) runtime. Selecting edgechromium backend.")
+                return "edgechromium"
+            logging.info("Edge (WebView2) backend not available. Falling back to default GUI backend.")
+        except Exception as exc:  # pylint: disable=broad-except
+            logging.debug("Edge backend detection failed: %s", exc)
+    else:
+        logging.info("Non-Windows platform detected. Using pywebview default GUI backend.")
+    return None
+
+
 class TTSManager:
     def __init__(self, speaker: int = DEFAULT_SPEAKER) -> None:
         self.speaker = speaker
@@ -283,24 +306,24 @@ class PresentationBridge:
         self.app = app
 
     def notify_ready(self) -> bool:
-        self.app.queue_event(("ready", None))
+        self.app.post_ui_event("presentation_ready")
         return True
 
     def request_tts_chunks(self, payload: Dict[str, List[Dict[str, int]]]) -> bool:
-        self.app.queue_event(("tts_request", payload))
+        self.app.post_ui_event("tts_request", payload)
         return True
 
     def status(self, payload: Dict[str, int]) -> bool:
-        self.app.queue_event(("status", payload))
+        self.app.post_ui_event("status", payload)
         return True
 
     def error(self, payload: Dict[str, str]) -> bool:
-        self.app.queue_event(("error", payload))
+        self.app.post_ui_event("error", payload)
         return True
 
 
 class QuizApp:
-    def __init__(self, quiz_path: str) -> None:
+    def __init__(self, quiz_path: str, debug: bool = False) -> None:
         self.base_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
         os.chdir(self.base_dir)
         self.quiz_path = quiz_path
@@ -311,10 +334,11 @@ class QuizApp:
         self.root.title("Quiz Control")
         self.bridge = PresentationBridge(self)
         self.window: Optional[webview.Window] = None
+        self.webview_ready = False
         self.presentation_ready = False
         self.current_question: Optional[QuizQuestion] = None
         self.current_status: Dict[str, int] = {"page": 1, "totalPages": 1, "phraseIndex": 0, "ttsQueue": 0}
-        self.event_queue: queue.Queue = queue.Queue()
+        self.ui_queue: queue.Queue = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.tts_manager = TTSManager()
         self.voicevox_alerted = False
@@ -328,6 +352,10 @@ class QuizApp:
         self.voicevox_var = tk.StringVar(value="未確認")
         self.questions_listbox: Optional[tk.Listbox] = None
         self.answer_text = tk.StringVar(value="")
+        self.debug_enabled = debug or os.environ.get("DEBUG") == "1"
+        self.debug_until = time.time() + 30 if self.debug_enabled else 0.0
+        if self.debug_enabled:
+            logging.info("Event flow debug logging enabled for 30 seconds.")
         self.create_control_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<space>", self.handle_stop_hotkey)
@@ -337,7 +365,18 @@ class QuizApp:
         self.root.bind("<Next>", self.handle_page_down)
         self.root.bind("<Prior>", self.handle_page_up)
         self.root.bind("<Escape>", self.handle_escape)
-        self.root.after(50, self.process_events)
+        self.root.after(50, self._drain_ui_queue)
+        if self.questions:
+            self.set_current_question(0)
+            if self.questions_listbox:
+                self.questions_listbox.selection_set(0)
+
+    def _debug(self, message: str, *args: object) -> None:
+        if not self.debug_enabled:
+            return
+        if self.debug_until and time.time() > self.debug_until:
+            return
+        logging.debug("[thread:%s] " + message, threading.current_thread().name, *args)
 
     def create_control_ui(self) -> None:
         main_frame = ttk.Frame(self.root, padding=12)
@@ -405,8 +444,9 @@ class QuizApp:
         answer_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         ttk.Label(answer_frame, textvariable=self.answer_text, wraplength=280, justify=tk.LEFT).pack(anchor=tk.W, padx=4, pady=4)
 
-    def queue_event(self, event: Tuple[str, Optional[Dict]]) -> None:
-        self.event_queue.put(event)
+    def post_ui_event(self, event: str, payload: Optional[Dict] = None) -> None:
+        self._debug("queue %s", event)
+        self.ui_queue.put((event, payload))
 
     def on_select_question(self, _event: object) -> None:
         if not self.questions_listbox:
@@ -512,32 +552,62 @@ class QuizApp:
             self.send_command("set_compact", {"value": bool(self.compact_var.get())})
 
     def on_presentation_ready(self) -> None:
+        if self.presentation_ready:
+            self._debug("presentation bridge already initialized")
+            return
         self.presentation_ready = True
+        self._debug("presentation bridge ready")
         self.voicevox_var.set("確認中")
         available = self.tts_manager.check_service()
-        self.voicevox_var.set("起動中" if available else "未起動")
+        if available:
+            self.voicevox_var.set("起動中")
+            self.voicevox_alerted = False
+        else:
+            self.voicevox_var.set("未起動")
+            self.voicevox_alerted = True
         if self.questions:
             self.set_current_question(0)
 
-    def process_events(self) -> None:
+    def _drain_ui_queue(self) -> None:
         try:
             while True:
-                event, payload = self.event_queue.get_nowait()
-                if event == "ready":
+                event, payload = self.ui_queue.get_nowait()
+                self._debug("dispatch %s", event)
+                if event == "webview_ready":
+                    self._handle_webview_ready()
+                elif event == "presentation_ready":
                     self.on_presentation_ready()
                 elif event == "tts_request":
-                    self.handle_tts_request(payload)
+                    if isinstance(payload, dict):
+                        self.handle_tts_request(payload)
                 elif event == "status":
-                    self.update_status(payload)
+                    if isinstance(payload, dict):
+                        self.update_status(payload)
                 elif event == "error":
                     logging.error("Presentation error: %s", payload)
                 elif event == "play_chunk":
-                    self.send_command("play_chunk", payload)
+                    if isinstance(payload, dict):
+                        self.send_command("play_chunk", payload)
+                elif event == "voicevox_unavailable":
+                    self._handle_voicevox_unavailable()
         except queue.Empty:
             pass
-        self.root.after(50, self.process_events)
+        self.root.after(50, self._drain_ui_queue)
 
-    def handle_tts_request(self, payload: Dict[str, List[Dict[str, int]]]) -> None:
+    def _handle_webview_ready(self) -> None:
+        if self.webview_ready:
+            return
+        self.webview_ready = True
+        self._debug("webview ready acknowledged")
+
+    def _handle_voicevox_unavailable(self) -> None:
+        if self.voicevox_alerted:
+            return
+        self.voicevox_alerted = True
+        self.voicevox_var.set("未起動")
+        logging.warning("VOICEVOX is not available. Proceeding silently.")
+
+    def handle_tts_request(self, payload: Optional[Dict[str, List[Dict[str, int]]]]) -> None:
         if not self.current_question or not payload:
             return
         slices = payload.get("slice", [])
@@ -575,11 +645,11 @@ class QuizApp:
     def generate_chunk(self, chunk_id: str, text: str, is_kana: bool) -> None:
         audio = self.tts_manager.synthesize(text, is_kana=is_kana)
         if audio:
-            self.queue_event(("play_chunk", {"id": chunk_id, "wavBase64": audio}))
-        elif not self.voicevox_alerted and not self.tts_manager.check_service():
-            self.voicevox_alerted = True
-            self.voicevox_var.set("未起動")
-            logging.warning("VOICEVOX is not available. Proceeding silently.")
+            self.post_ui_event("play_chunk", {"id": chunk_id, "wavBase64": audio})
+        elif not self.tts_manager.check_service():
+            self.post_ui_event("voicevox_unavailable")
+        else:
+            self._debug("No audio generated for chunk %s", chunk_id)
 
     def update_status(self, payload: Dict[str, int]) -> None:
         self.current_status.update(payload)
@@ -592,10 +662,12 @@ class QuizApp:
         self.queue_var.set(str(queue_len))
 
     def send_command(self, action: str, data: Dict) -> None:
-        if not self.window:
+        if not self.window or not self.webview_ready:
+            self._debug("skip %s (webview not ready)", action)
             return
         message = json.dumps({"action": action, "data": data}, ensure_ascii=False)
         script = f"window.appBridge && window.appBridge.receive({message});"
+        self._debug("send %s", action)
         try:
             self.window.evaluate_js(script)
         except Exception as exc:  # pylint: disable=broad-except
@@ -656,25 +728,31 @@ class QuizApp:
             height=900,
             resizable=True,
         )
-        webview.start(func=self.on_webview_ready, http_server=True, gui="tk")
+        backend = select_webview_gui()
+        start_kwargs = {"func": self.on_webview_ready, "http_server": True}
+        if backend:
+            logging.info("Starting pywebview with GUI backend: %s", backend)
+            start_kwargs["gui"] = backend
+        else:
+            logging.info("Starting pywebview with default GUI backend.")
+        webview.start(**start_kwargs)
 
     def on_webview_ready(self) -> None:
-        self.root.after(0, self.after_webview_ready)
-
-    def after_webview_ready(self) -> None:
-        if self.questions:
-            self.set_current_question(0)
-        self.update_cps()
-        self.update_pause_factor()
-        self.update_zoom()
-        self.update_compact()
+        self.post_ui_event("webview_ready")
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
     base_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
     default_quiz = os.path.join(base_dir, "samples", "sample.quiz.txt")
-    app = QuizApp(default_quiz)
+    parser = argparse.ArgumentParser(description="Quiz presentation control app")
+    parser.add_argument("--quiz", default=default_quiz, help="Path to quiz file (default: samples/sample.quiz.txt)")
+    parser.add_argument("--debug", action="store_true", help="Enable event flow debug logging for 30 seconds")
+    args = parser.parse_args()
+    debug_env = os.environ.get("DEBUG") == "1"
+    log_level = logging.DEBUG if args.debug or debug_env else logging.INFO
+    logging.basicConfig(level=log_level, format="[%(levelname)s] %(message)s")
+    quiz_path = args.quiz or default_quiz
+    app = QuizApp(quiz_path, debug=args.debug or debug_env)
     app.run()
 
 
