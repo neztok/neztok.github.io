@@ -119,6 +119,6 @@ EXPLAIN:
 
 ## 開発者向けメモ
 
-- Windows 環境では Microsoft Edge WebView2 Runtime が必須です。必要に応じて `PYWEBVIEW_GUI=edgechromium` を設定すると Edge (WebView2) バックエンドを強制できます。
-- プレゼン画面は `web/index.html` を `file:///...` 形式の絶対 URL として pywebview に読み込ませています。相対パスやカレントディレクトリに依存する指定は白画面の原因になります。
-- Tkinter のウィジェット操作はメインスレッドの `root.after` で処理するイベントループ内でのみ行い、pywebview や TTS などのワーカースレッドからは `queue.Queue` にイベントを積んで連携します。
+- Windows 環境では Microsoft Edge WebView2 Runtime が必須です。必要に応じて `PYWEBVIEW_GUI=edgechromium` を設定すると Edge WebView2 バックエンドを強制できます。
+- Tk はメインスレッドで `mainloop()` を回し、pywebview はワーカースレッド（`WebviewThread`）で起動します。UI イベントは必ず `queue.Queue` 経由で `_drain_ui_queue()` に渡し、Tk ウィジェットへはメインスレッドのみがアクセスします。
+- プレゼン画面は `web/index.html` を `file:///` 絶対URL として pywebview に読み込ませています。相対パスやカレントディレクトリに依存する指定は白画面の原因になります。

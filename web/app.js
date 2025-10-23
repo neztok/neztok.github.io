@@ -625,9 +625,12 @@ window.appBridge = {
 
 function notifyReady() {
   if (readyNotified) return;
-  if (!window.pywebview?.api?.notify_ready) return;
+  const api = window.pywebview?.api;
+  if (!api) return;
+  const invoke = api.ready || api.notify_ready;
+  if (!invoke) return;
   readyNotified = true;
-  window.pywebview.api.notify_ready().catch(() => {
+  Promise.resolve(invoke.call(api)).catch(() => {
     readyNotified = false;
   });
 }
