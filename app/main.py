@@ -302,6 +302,9 @@ class BridgeClientBase:
     def send(self, action: str, data: Optional[Dict] = None) -> None:
         raise NotImplementedError
 
+    def send_payload(self, payload: Dict) -> None:
+        raise NotImplementedError
+
     def close(self) -> None:
         raise NotImplementedError
 
@@ -409,6 +412,10 @@ class WebSocketBridgeClient(BridgeClientBase):
     def send(self, action: str, data: Optional[Dict] = None) -> None:
         payload = json.dumps({"action": action, "data": data or {}})
         self.out_queue.put(payload)
+
+    def send_payload(self, payload: Dict) -> None:
+        message = json.dumps(payload)
+        self.out_queue.put(message)
 
     def close(self) -> None:
         self.stop_event.set()
@@ -521,6 +528,13 @@ class HttpBridgeClient(BridgeClientBase):
         except requests.RequestException as exc:
             logging.warning("HTTP bridge send failed: %s", exc)
 
+    def send_payload(self, payload: Dict) -> None:
+        try:
+            response = self.session.post(f"{self.base_url}/api/cmd", json=payload, timeout=5)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logging.warning("HTTP bridge send failed: %s", exc)
+
     def close(self) -> None:
         self.stop_event.set()
         if self.reader and self.reader.is_alive():
@@ -570,6 +584,14 @@ class PresenterProcess:
         if not self.bridge:
             return
         self.bridge.send(action, data)
+
+    def send_payload(self, payload: Dict) -> None:
+        if not self.bridge:
+            return
+        try:
+            self.bridge.send_payload(payload)
+        except NotImplementedError:
+            self.bridge.send("PRESENTATION_INIT", payload)
 
     def stop(self) -> None:
         self._stopping = True
@@ -735,6 +757,11 @@ class QuizApp:
     def _handle_event(self, event: str, payload: Optional[Dict]) -> None:
         if event == "READY":
             self.on_presentation_ready()
+            if self.presenter:
+                try:
+                    self.presenter.send_payload({"type": "PRESENTATION_INIT"})
+                except Exception as exc:  # pylint: disable=broad-except
+                    logging.debug("Failed to send PRESENTATION_INIT: %s", exc)
         elif event == "STATUS":
             if isinstance(payload, dict):
                 self.update_status(payload)
@@ -827,6 +854,7 @@ class QuizApp:
     def create_question_payload(self, question: QuizQuestion) -> Dict:
         return {
             "id": question.identifier,
+            "title": question.title,
             "text": question.display_text,
             "answers": question.answers,
             "explain": question.explain,

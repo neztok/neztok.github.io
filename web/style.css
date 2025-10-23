@@ -40,6 +40,31 @@ body {
   transition: transform var(--transition-fast) ease;
 }
 
+.connection-badge {
+  position: absolute;
+  top: 12px;
+  left: 16px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: rgba(92, 92, 92, 0.75);
+  color: #fff;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  backdrop-filter: blur(6px);
+  pointer-events: none;
+  transition: background-color var(--transition-fast) ease, color var(--transition-fast) ease;
+}
+
+.connection-badge[data-state='connected'] {
+  background: rgba(118, 156, 191, 0.85);
+}
+
+.connection-badge[data-state='ready'] {
+  background: rgba(76, 153, 110, 0.9);
+}
+
 #titleBar {
   display: flex;
   justify-content: space-between;

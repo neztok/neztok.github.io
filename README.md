@@ -32,6 +32,11 @@ requirements.txt  # 必要ライブラリ
 
 WebSocket ブリッジでは、親プロセスは `ws://127.0.0.1:<ポート>/control`、プレゼン JS は `ws://127.0.0.1:<ポート>/presentation` に接続します。同じポート番号を共有しつつ、URL パスで役割を分けます（旧クライアントの `/` アクセスは暫定的に `/presentation` として扱われます）。
 
+#### 接続URLとデバッグ
+
+- WebSocket / HTTP いずれも **同じポート**を共有し、`/control`（コントロール）と `/presentation`（プレゼン）の 2 つの経路だけを使います。`/presentation` 以外のルートには接続しないでください。
+- プレゼン画面で `Ctrl+Shift+I`（macOS は `Cmd+Option+I`）を押すと DevTools が開きます。`Console` タブを選択し、最上段の 1 行目に表示されるメッセージで接続 URL・切断コード・最初に発生したエラーを確認できます。
+
 フロー概要:
 
 ```
