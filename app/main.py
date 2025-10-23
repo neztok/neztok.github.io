@@ -827,6 +827,7 @@ class QuizApp:
     def create_question_payload(self, question: QuizQuestion) -> Dict:
         return {
             "id": question.identifier,
+            "title": question.title,
             "text": question.display_text,
             "answers": question.answers,
             "explain": question.explain,
