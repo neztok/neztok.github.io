@@ -30,6 +30,8 @@ requirements.txt  # 必要ライブラリ
 で伝達します。外部に公開されないローカルループバック通信のため、通常は追加設定不要ですが、企業ネットワークなどで localhost への接続が
 制限されている場合は、使用ポートの通過を許可してください。
 
+WebSocket ブリッジでは、親プロセスは `ws://127.0.0.1:<ポート>/control`、プレゼン JS は `ws://127.0.0.1:<ポート>/presentation` に接続します。同じポート番号を共有しつつ、URL パスで役割を分けます。
+
 フロー概要:
 
 ```
@@ -79,6 +81,7 @@ python app/main.py --bridge ws --debug
 
 - `--bridge` を省略すると WebSocket ブリッジが選択されます。HTTP + SSE を試す場合は `--bridge http` を指定してください。
 - `--port` を省略すると、未使用のポートを自動で割り当てます。ファイアウォール設定済みのポートを使う場合のみ明示的に指定します（例: `--port 8765`）。
+- WebSocket ブリッジ時は、親プロセス（`/control`）とプレゼン JS（`/presentation`）が同じポートで待ち合わせます。必ず両方に同一の `--port` を指定してください。
 - `--debug` または環境変数 `DEBUG=1` を指定すると、起動から 30 秒間は親プロセスが WebSocket 接続のリトライ間隔や割り当てポートを、子プロセスが GUI バックエンドと `index.html` の絶対 URL、`WS listening on ws://...` といった診断ログを INFO レベルで出力します。
 - Windows では Microsoft Edge WebView2 ランタイムが必須です。`PYWEBVIEW_GUI=edgechromium` を設定すると Edge バックエンドを強制できます。
 - VOICEVOX エンジンが未起動でも 10 秒間隔で再検出します。後からエンジンを立ち上げた場合は、コントロール画面で「開始」を押し直せば音声が再取得されます。

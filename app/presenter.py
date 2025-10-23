@@ -79,7 +79,8 @@ class WebSocketBridgeServer(BridgeServerBase):
             self.loop = loop
             asyncio.set_event_loop(loop)
 
-            async def handler(websocket, path):  # type: ignore
+            async def handler(websocket):  # type: ignore
+                path = getattr(websocket, "path", "/")
                 logging.info("WebSocket client connected: path=%s", path)
                 try:
                     if path == "/control":
@@ -91,8 +92,7 @@ class WebSocketBridgeServer(BridgeServerBase):
                         await websocket.close(code=1008, reason="unsupported path")
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("Unhandled error in WebSocket handler (path=%s)", path)
-                    with contextlib.suppress(Exception):
-                        await websocket.close(code=1011, reason="internal error")
+                    raise
                 finally:
                     code = getattr(websocket, "close_code", None)
                     reason = getattr(websocket, "close_reason", "")
