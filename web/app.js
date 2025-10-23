@@ -27,6 +27,293 @@ let elements = {};
 let statusFrameToken = null;
 let readyNotified = false;
 
+const params = new URLSearchParams(window.location.search || '');
+const bridgeMode = (params.get('mode') || 'ws').toLowerCase();
+const bridgePort = Number.parseInt(params.get('port') || '8765', 10);
+const bridgeWsUrl = `ws://127.0.0.1:${bridgePort}/presentation`;
+const bridgeHttpBase = `http://127.0.0.1:${bridgePort}`;
+
+function createWebSocketBridge(url) {
+  const listeners = new Set();
+  const openListeners = new Set();
+  let socket = null;
+  let ready = false;
+  const queue = [];
+  let manualClose = false;
+  let reconnectTimer = null;
+
+  function notifyOpen() {
+    ready = true;
+    openListeners.forEach((cb) => {
+      try {
+        cb();
+      } catch (err) {
+        console.error('bridge open handler failed', err);
+      }
+    });
+  }
+
+  function notifyMessage(data) {
+    listeners.forEach((cb) => {
+      try {
+        cb(data);
+      } catch (err) {
+        console.error('bridge message handler failed', err);
+      }
+    });
+  }
+
+  function connect(delay = 0) {
+    if (manualClose) {
+      return;
+    }
+    if (socket) {
+      try {
+        socket.close();
+      } catch (err) {
+        // ignore close errors
+      }
+    }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+    }
+    reconnectTimer = setTimeout(() => {
+      if (manualClose) {
+        return;
+      }
+      socket = new WebSocket(url);
+      socket.onopen = () => {
+        const pending = queue.splice(0);
+        pending.forEach((msg) => socket.send(msg));
+        notifyOpen();
+      };
+      socket.onmessage = (event) => {
+        notifyMessage(event.data);
+      };
+      socket.onerror = () => {
+        if (socket) {
+          try {
+            socket.close();
+          } catch (err) {
+            // ignore
+          }
+        }
+      };
+      socket.onclose = () => {
+        ready = false;
+        if (!manualClose) {
+          connect(500);
+        }
+      };
+    }, delay);
+  }
+
+  connect();
+
+  return {
+    send(message) {
+      const payload = typeof message === 'string' ? message : JSON.stringify(message);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(payload);
+      } else {
+        queue.push(payload);
+      }
+    },
+    onMessage(callback) {
+      if (typeof callback === 'function') {
+        listeners.add(callback);
+      }
+    },
+    onOpen(callback) {
+      if (typeof callback === 'function') {
+        openListeners.add(callback);
+        if (socket && socket.readyState === WebSocket.OPEN) {
+          callback();
+        }
+      }
+    },
+    close() {
+      manualClose = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      listeners.clear();
+      openListeners.clear();
+      if (socket) {
+        try {
+          socket.close();
+        } catch (err) {
+          // ignore
+        }
+        socket = null;
+      }
+    },
+  };
+}
+
+function createHttpBridge(baseUrl) {
+  const listeners = new Set();
+  const openListeners = new Set();
+  let source = null;
+  let manualClose = false;
+  let reconnectTimer = null;
+
+  function notifyOpen() {
+    openListeners.forEach((cb) => {
+      try {
+        cb();
+      } catch (err) {
+        console.error('bridge open handler failed', err);
+      }
+    });
+  }
+
+  function notifyMessage(data) {
+    listeners.forEach((cb) => {
+      try {
+        cb(data);
+      } catch (err) {
+        console.error('bridge message handler failed', err);
+      }
+    });
+  }
+
+  function connect(delay = 0) {
+    if (manualClose) {
+      return;
+    }
+    if (source) {
+      try {
+        source.close();
+      } catch (err) {
+        // ignore
+      }
+    }
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+    }
+    reconnectTimer = setTimeout(() => {
+      if (manualClose) {
+        return;
+      }
+      source = new EventSource(`${baseUrl}/api/presentation/events`, { withCredentials: false });
+      source.onopen = () => {
+        notifyOpen();
+      };
+      source.onmessage = (event) => {
+        notifyMessage(event.data);
+      };
+      source.onerror = () => {
+        try {
+          source.close();
+        } catch (err) {
+          // ignore
+        }
+        if (!manualClose) {
+          connect(1000);
+        }
+      };
+    }, delay);
+  }
+
+  connect();
+
+  return {
+    send(message) {
+      const payload = typeof message === 'string' ? message : JSON.stringify(message);
+      fetch(`${baseUrl}/api/presentation`, {
+        method: 'POST',
+        mode: 'cors',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload,
+      }).catch((err) => {
+        console.error('bridge http send failed', err);
+      });
+    },
+    onMessage(callback) {
+      if (typeof callback === 'function') {
+        listeners.add(callback);
+      }
+    },
+    onOpen(callback) {
+      if (typeof callback === 'function') {
+        openListeners.add(callback);
+      }
+    },
+    close() {
+      manualClose = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      listeners.clear();
+      openListeners.clear();
+      if (source) {
+        try {
+          source.close();
+        } catch (err) {
+          // ignore
+        }
+        source = null;
+      }
+    },
+  };
+}
+
+let bridgeConnection = null;
+let bridgeReceiver = null;
+let pendingBridgeMessages = [];
+
+function ensureBridge() {
+  if (!bridgeConnection) {
+    bridgeConnection = bridgeMode === 'http' ? createHttpBridge(bridgeHttpBase) : createWebSocketBridge(bridgeWsUrl);
+    bridgeConnection.onMessage((message) => {
+      if (bridgeReceiver) {
+        bridgeReceiver(message);
+      } else {
+        pendingBridgeMessages.push(message);
+      }
+    });
+    bridgeConnection.onOpen(() => {
+      notifyReady();
+    });
+  }
+  return bridgeConnection;
+}
+
+function closeBridgeConnection() {
+  if (bridgeConnection && typeof bridgeConnection.close === 'function') {
+    try {
+      bridgeConnection.close();
+    } catch (err) {
+      console.error('bridge close failed', err);
+    }
+  }
+  bridgeConnection = null;
+  bridgeReceiver = null;
+  pendingBridgeMessages = [];
+}
+
+function setBridgeReceiver(handler) {
+  bridgeReceiver = handler;
+  if (pendingBridgeMessages.length && typeof handler === 'function') {
+    const queued = pendingBridgeMessages.splice(0);
+    queued.forEach((message) => {
+      try {
+        handler(message);
+      } catch (err) {
+        console.error('bridge queued message failed', err);
+      }
+    });
+  }
+}
+
+function sendCommand(action, data = {}) {
+  const bridge = ensureBridge();
+  bridge.send({ action, data });
+}
+
 function segmentGraphemes(text) {
   if (!segmenter) {
     return Array.from(text);
@@ -242,7 +529,7 @@ function resetTtsPrefetch(options = {}) {
 
 function requestAudioForUpcoming() {
   const page = currentPage();
-  if (!page || !window.pywebview?.api?.request_tts_chunks) return;
+  if (!page) return;
   const ahead = 3;
   for (let offset = 0; offset < ahead; offset += 1) {
     const index = state.phraseIndex + offset;
@@ -254,29 +541,19 @@ function requestAudioForUpcoming() {
     state.requestedChunks.add(chunkId);
     const controller = new AbortController();
     state.ttsControllers.set(chunkId, controller);
-    Promise.resolve(
-      window.pywebview.api.request_tts_chunks({
-        slice: [
-          {
-            id: chunkId,
-            start: page.start + phrase.start,
-            end: page.start + phrase.end,
-          },
-        ],
-      })
-    )
-      .catch((err) => {
-        if (!controller.signal.aborted) {
-          state.requestedChunks.delete(chunkId);
-          reportError('tts_request_failed', err);
-        }
-      })
-      .finally(() => {
-        const existing = state.ttsControllers.get(chunkId);
-        if (existing === controller) {
-          state.ttsControllers.delete(chunkId);
-        }
-      });
+    sendCommand('TTS_REQUEST', {
+      slice: [
+        {
+          id: chunkId,
+          startChar: page.start + phrase.start,
+          endChar: page.start + phrase.end,
+        },
+      ],
+    });
+    controller.signal.addEventListener('abort', () => {
+      state.requestedChunks.delete(chunkId);
+      state.ttsControllers.delete(chunkId);
+    });
   }
 }
 
@@ -304,14 +581,13 @@ function scheduleStatus() {
 }
 
 function sendStatus() {
-  if (!window.pywebview?.api?.status) return;
   const payload = {
     page: state.pageIndex + 1,
     totalPages: state.pages.length || 1,
     phraseIndex: Math.max(1, state.phraseIndex + 1),
     ttsQueue: audioManager.queueLength(),
   };
-  window.pywebview.api.status(payload).catch((err) => reportError('status_failed', err));
+  sendCommand('STATUS', payload);
 }
 
 function flashOverlay() {
@@ -566,10 +842,8 @@ async function setPage(index, options = {}) {
 
 function reportError(code, error) {
   console.error(code, error);
-  if (window.pywebview?.api?.error) {
-    const message = error && error.message ? error.message : String(error);
-    window.pywebview.api.error({ code, message }).catch(() => {});
-  }
+  const message = error && error.message ? error.message : String(error);
+  sendCommand('ERROR', { code, message });
 }
 
 const handlers = {
@@ -671,19 +945,14 @@ window.appBridge = {
   },
 };
 
+setBridgeReceiver(window.appBridge.receive);
+ensureBridge();
+
 function notifyReady() {
   if (readyNotified) return;
-  const api = window.pywebview?.api;
-  if (!api) return;
-  const invoke = api.ready || api.notify_ready;
-  if (!invoke) return;
   readyNotified = true;
-  Promise.resolve(invoke.call(api)).catch(() => {
-    readyNotified = false;
-  });
+  sendCommand('READY', {});
 }
-
-document.addEventListener('pywebviewready', notifyReady);
 
 document.addEventListener('DOMContentLoaded', () => {
   elements = {
@@ -701,9 +970,12 @@ document.addEventListener('DOMContentLoaded', () => {
   setCompact(state.compact);
   updateSettingsHint();
   scheduleStatus();
-  notifyReady();
 });
 
 window.addEventListener('error', (event) => {
   reportError('runtime_error', event.error || event.message);
+});
+
+window.addEventListener('beforeunload', () => {
+  closeBridgeConnection();
 });

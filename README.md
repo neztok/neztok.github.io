@@ -5,7 +5,8 @@ Discord での画面共有を想定したクイズ出題用アプリです。Tki
 ## 構成
 
 ```
-app/main.py       # Tkinter コントロール UI・pywebview ブリッジ・VOICEVOX 連携
+app/main.py       # Tkinter コントロール UI・子プロセス制御・VOICEVOX 連携
+app/presenter.py  # プレゼンテーション用サブプロセス（pywebview + ブリッジサーバ）
 web/index.html    # プレゼンテーション画面 HTML
 web/style.css     # プレゼンテーション画面のテーマ・レイアウト
 web/app.js        # タイプライタ制御・ページ分割・WebAudio 再生
@@ -13,12 +14,41 @@ samples/sample.quiz.txt  # クイズデータ（v1形式）
 requirements.txt  # 必要ライブラリ
 ```
 
+### 2 プロセス構成
+
+本アプリは Tkinter のコントロール UI と pywebview のプレゼン画面を**別プロセス**で動作させます。親プロセス（`app/main.py`）は Tk メイン
+ループを保持し、子プロセス（`app/presenter.py`）が pywebview ウィンドウとブリッジサーバを起動します。両プロセス間の通信は JSON メッ
+セージで行い、以下の 2 種類から選択できます。
+
+- `--bridge ws`（既定）: 子プロセスが WebSocket サーバ（`ws://127.0.0.1:<動的ポート>`）を立ち上げ、親プロセスとプレゼン JS 双方が接続し
+  ます。低レイテンシでリアルタイムにイベントを双方向転送できます。
+- `--bridge http`: 子プロセスが HTTP + Server-Sent Events（SSE）サーバを起動し、親→子は `POST /api/cmd`、子→親は `GET /api/events` の
+  SSE で通知します。プレゼン JS は `EventSource` でコマンドを受信し、`fetch` で状態を送信します。ファイアウォールで HTTP を許可しや
+  すい環境に適しています。
+
+いずれの場合も、子プロセスは起動時に未使用ポートを動的に割り当て、コントロール UI からプレゼン JS へクエリパラメータ（`mode` / `port`）
+で伝達します。外部に公開されないローカルループバック通信のため、通常は追加設定不要ですが、企業ネットワークなどで localhost への接続が
+制限されている場合は、使用ポートの通過を許可してください。
+
+フロー概要:
+
+```
+Tk (app/main.py)
+   │ JSON / queue
+   ▼
+Bridge server + pywebview (app/presenter.py)
+   │ WebSocket / HTTP (JSON)
+   ▼
+Presentation JS (web/app.js)
+```
+
 ## 前提条件
 
 - Python 3.10 以上
 - VOICEVOX エンジン（ローカル API を `http://127.0.0.1:50021` で提供）
 - 音声出力が可能な環境（WebAudio を使用）
-- Windows / macOS / Linux で動作確認済み。Windows では Microsoft Edge WebView2 ランタイム（pywebview の `edgechromium` バックエンド）を利用します。
+- Windows / macOS / Linux で動作確認済み。Windows では Microsoft Edge WebView2 ランタイム（pywebview の `edgechromium` バックエンド）が必須です。未導入の場合は Microsoft 公式サイトからインストールし、必要に応じて `PYWEBVIEW_GUI=edgechromium` を指定してください。
+- 親子プロセス間でローカルループバック通信（`127.0.0.1:<動的ポート>`）を使用します。企業ネットワークなどで localhost への WebSocket / HTTP 通信が制限される場合は、適宜許可を与えてください。
 
 ## セットアップ
 
@@ -42,11 +72,21 @@ requirements.txt  # 必要ライブラリ
 ## 実行方法
 
 ```bash
-python app/main.py
+# 低レイテンシな WebSocket ブリッジ（既定）
+python app/main.py --bridge ws
+
+# HTTP + SSE ブリッジを試す場合
+python app/main.py --bridge http
+
+# ポートを固定したい場合（例: 8765 番）
+python app/main.py --bridge ws --port 8765
 ```
 
-- Windows で WebView2 ランタイムが未導入の場合は Microsoft Edge WebView2 ランタイムをインストールしてください。必要に応じて `PYWEBVIEW_GUI=edgechromium` を指定すると Edge バックエンドを強制できます。
-- 起動時に `python app/main.py --debug` や `DEBUG=1 python app/main.py` を利用すると、30 秒間イベントフローの詳細ログが INFO ログに混在して出力されます。
+- `--bridge` を省略すると WebSocket 方式で起動します。HTTP モードでは `EventSource` によるサーバープッシュを使用するため、一部のセキュリティ製品でブロックされる場合があります。
+- `--port` を指定しない場合は、利用可能なポートが自動で割り当てられます。特定のポートを開放済みで固定運用したい場合にだけ明示的に指定してください。
+- Windows で WebView2 ランタイムが未導入の場合は Microsoft Edge WebView2 ランタイムをインストールしてください。`PYWEBVIEW_GUI=edgechromium` を指定すると Edge バックエンドを強制できます。
+- `python app/main.py --debug` または `DEBUG=1 python app/main.py` を指定すると、起動から 30 秒間はブリッジ接続やイベントの詳細ログを INFO レベルに出力します。子プロセス側で `--debug` を付与（親から自動で継承）すると、プレゼン側でもバックエンド名や `index.html` の絶対パスを記録します。
+- VOICEVOX エンジンが起動していない状態で開始しても、アプリは 10 秒間隔でサービスの再検出を行います。後から VOICEVOX を立ち上げた場合でも再度「開始」を押せば接続できます。
 
 - **コントロール画面**（Tkinter）と **プレゼン画面**（pywebview）の 2 つのウィンドウが開きます。
 - 初期状態では `samples/sample.quiz.txt` を読み込みます。別ファイルを利用する場合は「クイズを開く」ボタンから選択してください。
@@ -113,6 +153,7 @@ EXPLAIN:
 | プレゼン画面が真っ白 | `web/index.html` が読み込めていない可能性があります。`python app/main.py` をプロジェクトルートで実行しているか確認してください。 |
 | WebAudio が再生されない | ブラウザコンテキストがサスペンドされた場合があります。タイプライタ開始や再開を行うと AudioContext が自動的に `resume()` されます。 |
 | 長文が収まらない | 自動縮小とスクロールが働かない場合は、問題文を句読点で分割するなど調整してください。 |
+| READY が届かずコントロールに「未接続」と表示される | ファイアウォールで `127.0.0.1:<動的ポート>` への WebSocket / HTTP 通信が遮断されていないか確認してください。HTTP ブリッジの場合は `http://127.0.0.1:<ポート>/api/presentation/events` への EventSource が許可されている必要があります。 |
 
 ## ライセンス
 
@@ -120,6 +161,7 @@ EXPLAIN:
 
 ## 開発者向けメモ
 
-- Windows 環境では Microsoft Edge WebView2 Runtime が必須です。必要に応じて `PYWEBVIEW_GUI=edgechromium` を設定すると Edge WebView2 バックエンドを強制できます。
-- Tk はメインスレッドで `mainloop()` を回し、pywebview はワーカースレッド（`WebviewThread`）で起動します。UI イベントは必ず `queue.Queue` 経由で `_drain_ui_queue()` に渡し、Tk ウィジェットへはメインスレッドのみがアクセスします。
-- プレゼン画面は `web/index.html` を `file:///` 絶対URL として pywebview に読み込ませています。相対パスやカレントディレクトリに依存する指定は白画面の原因になります。
+- 親プロセス（`app/main.py`）は Tk メインスレッドで `mainloop()` を実行し、子プロセスを `subprocess.Popen` で起動します。Tk ウィジェット操作はすべて `_drain_ui_queue()` 内（メインスレッド）に集約してください。
+- 子プロセス（`app/presenter.py`）は pywebview ウィンドウとブリッジサーバを同一プロセスで立ち上げます。WebSocket モードでは `websockets`、HTTP モードでは `aiohttp` を使用します。双方とも JSON メッセージのみを送受信し、Tk オブジェクトを参照しません。
+- プレゼン HTML は常に `index_path.resolve().as_uri()` で得た `file:///` 絶対 URL を用いて読み込みます。相対パス指定は白画面やリソース読み込み失敗の原因になります。
+- `--debug` を指定すると、親はブリッジモード・割り当てポートを INFO ログに出力し、子は GUI バックエンドと `index.html` の絶対パスを記録します。動作確認やポート解放確認時に活用してください。

@@ -1,2 +1,7 @@
+# Core UI and VOICEVOX integration
 pywebview>=4.2.2
 requests>=2.31.0
+
+# Bridge servers
+aiohttp>=3.9.0
+websockets>=12.0

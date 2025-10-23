@@ -5,24 +5,26 @@ import logging
 import os
 import queue
 import re
+import socket
+import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
-
 from pathlib import Path
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import requests
-import webview
 
 VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER = 1
 MAX_CHARS_PER_TTS = 30
+BRIDGE_WS = "ws"
+BRIDGE_HTTP = "http"
 
 
 @dataclass
@@ -126,7 +128,7 @@ def parse_question_text(raw_text: str, dictionaries: List[Dict[str, str]]) -> Tu
         index += 1
     display_text = "".join(builder)
 
-    def add_dictionary_entries(entries: List[Dict[str, str]]) -> None:
+    def add_dictionary_entries(entries: Iterable[Dict[str, str]]) -> None:
         for entry in entries:
             surface = entry.get("surface", "").strip()
             yomi = entry.get("yomi", "").strip()
@@ -233,26 +235,6 @@ def parse_quiz_file(path: str) -> List[QuizQuestion]:
     return questions
 
 
-def select_webview_gui() -> Optional[str]:
-    env_gui = os.environ.get("PYWEBVIEW_GUI")
-    if env_gui:
-        logging.info("Using pywebview GUI backend from PYWEBVIEW_GUI=%s", env_gui)
-        return env_gui
-    if sys.platform.startswith("win"):
-        try:
-            from webview.platforms import edgechromium  # type: ignore
-
-            if edgechromium.is_available():  # type: ignore[attr-defined]
-                logging.info("Detected Edge (WebView2) runtime. Selecting edgechromium backend.")
-                return "edgechromium"
-            logging.info("Edge (WebView2) backend not available. Falling back to default GUI backend.")
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.debug("Edge backend detection failed: %s", exc)
-    else:
-        logging.info("Non-Windows platform detected. Using pywebview default GUI backend.")
-    return None
-
-
 class TTSManager:
     def __init__(self, speaker: int = DEFAULT_SPEAKER) -> None:
         self.speaker = speaker
@@ -260,16 +242,26 @@ class TTSManager:
         self.available: Optional[bool] = None
         self.warning_displayed = False
         self.lock = threading.Lock()
+        self._last_check = 0.0
+        self._retry_interval = 10.0
 
     def check_service(self) -> bool:
-        if self.available is not None:
+        if self.available is True:
+            return True
+        with self.lock:
+            if self.available is True:
+                return True
+            now = time.monotonic()
+            if self.available is False and (now - self._last_check) < self._retry_interval:
+                return False
+            try:
+                response = self.session.get(f"{VOICEVOX_URL}/version", timeout=2)
+                self.available = response.ok
+            except requests.RequestException:
+                self.available = False
+            finally:
+                self._last_check = now
             return self.available
-        try:
-            response = self.session.get(f"{VOICEVOX_URL}/version", timeout=2)
-            self.available = response.ok
-        except requests.RequestException:
-            self.available = False
-        return self.available
 
     def synthesize(self, text: str, is_kana: bool = False) -> Optional[str]:
         cleaned = prepare_tts_text(text)
@@ -303,54 +295,243 @@ class TTSManager:
             return None
 
 
-class Bridge:
-    __slots__ = ("ui_queue",)
+class BridgeClientBase:
+    def start(self) -> None:
+        raise NotImplementedError
 
-    def __init__(self, ui_queue: "queue.Queue") -> None:
-        self.ui_queue = ui_queue
+    def send(self, action: str, data: Optional[Dict] = None) -> None:
+        raise NotImplementedError
 
-    def _emit(self, event: str, payload: Optional[Dict] = None) -> bool:
-        self.ui_queue.put((event, payload))
-        return True
+    def close(self) -> None:
+        raise NotImplementedError
 
-    def ready(self) -> bool:
-        return self._emit("PRESENTATION_READY")
 
-    def notify_ready(self) -> bool:
-        return self.ready()
+class WebSocketBridgeClient(BridgeClientBase):
+    def __init__(self, host: str, port: int, callback: Callable[[Dict], None]) -> None:
+        self.host = host
+        self.port = port
+        self.callback = callback
+        self.loop = None
+        self.thread: Optional[threading.Thread] = None
+        self.stop_event = threading.Event()
+        self.out_queue: "queue.Queue[Optional[str]]" = queue.Queue()
 
-    def request_tts_chunks(self, payload: Dict[str, List[Dict[str, int]]]) -> bool:
-        return self._emit("TTS_REQUEST", payload)
+    def start(self) -> None:
+        import asyncio
+        import websockets
 
-    def status(self, payload: Dict[str, int]) -> bool:
-        return self._emit("STATUS", payload)
+        if self.thread:
+            return
 
-    def error(self, payload: Dict[str, str]) -> bool:
-        return self._emit("ERROR", payload)
+        def runner() -> None:
+            async def connect_loop() -> None:
+                uri = f"ws://{self.host}:{self.port}/control"
+                backoff = 0.5
+                while not self.stop_event.is_set():
+                    try:
+                        async with websockets.connect(uri) as websocket:
+                            backoff = 0.5
+                            receiver = asyncio.create_task(self._receiver(websocket))
+                            sender = asyncio.create_task(self._sender(websocket))
+                            done, pending = await asyncio.wait(
+                                [receiver, sender],
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            for task in pending:
+                                task.cancel()
+                            for task in done:
+                                if task.exception():
+                                    raise task.exception()
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logging.debug("WebSocket reconnect required: %s", exc)
+                        await asyncio.sleep(backoff)
+                        backoff = min(backoff * 2, 5)
+
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_until_complete(connect_loop())
+
+        self.thread = threading.Thread(target=runner, name="WebSocketBridge", daemon=True)
+        self.thread.start()
+
+    async def _receiver(self, websocket) -> None:  # type: ignore[override]
+        import json as json_module
+
+        async for message in websocket:
+            try:
+                payload = json_module.loads(message)
+            except json_module.JSONDecodeError:
+                logging.warning("Invalid JSON from presenter: %s", message)
+                continue
+            self.callback(payload)
+
+    async def _sender(self, websocket) -> None:  # type: ignore[override]
+        import asyncio
+
+        loop = asyncio.get_event_loop()
+        while not self.stop_event.is_set():
+            try:
+                message = await loop.run_in_executor(None, self.out_queue.get)
+            except Exception:
+                return
+            if message is None:
+                break
+            await websocket.send(message)
+
+    def send(self, action: str, data: Optional[Dict] = None) -> None:
+        payload = json.dumps({"action": action, "data": data or {}})
+        self.out_queue.put(payload)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.out_queue.put(None)
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1)
+
+
+class EventStreamReader(threading.Thread):
+    def __init__(self, session: requests.Session, url: str, callback: Callable[[Dict], None], stop_event: threading.Event) -> None:
+        super().__init__(name="SSEReader", daemon=True)
+        self.session = session
+        self.url = url
+        self.callback = callback
+        self.stop_event = stop_event
+
+    def run(self) -> None:  # type: ignore[override]
+        while not self.stop_event.is_set():
+            try:
+                with self.session.get(self.url, stream=True, timeout=30) as response:
+                    if response.status_code != 200:
+                        time.sleep(1)
+                        continue
+                    buffer = ""
+                    for raw in response.iter_lines(decode_unicode=True):
+                        if self.stop_event.is_set():
+                            break
+                        if raw is None:
+                            continue
+                        if raw.startswith("data:"):
+                            buffer += raw[5:].strip()
+                        elif raw == "":
+                            if buffer:
+                                try:
+                                    payload = json.loads(buffer)
+                                    self.callback(payload)
+                                except json.JSONDecodeError:
+                                    logging.warning("Malformed SSE payload: %s", buffer)
+                                buffer = ""
+                    time.sleep(0.2)
+            except requests.RequestException as exc:
+                logging.debug("SSE reconnect due to %s", exc)
+                time.sleep(1)
+
+
+class HttpBridgeClient(BridgeClientBase):
+    def __init__(self, host: str, port: int, callback: Callable[[Dict], None]) -> None:
+        self.host = host
+        self.port = port
+        self.callback = callback
+        self.session = requests.Session()
+        self.stop_event = threading.Event()
+        self.reader: Optional[EventStreamReader] = None
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+    def start(self) -> None:
+        if self.reader:
+            return
+        events_url = f"{self.base_url}/api/events"
+        self.reader = EventStreamReader(self.session, events_url, self.callback, self.stop_event)
+        self.reader.start()
+
+    def send(self, action: str, data: Optional[Dict] = None) -> None:
+        payload = {"action": action, "data": data or {}}
+        try:
+            response = self.session.post(f"{self.base_url}/api/cmd", json=payload, timeout=5)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            logging.warning("HTTP bridge send failed: %s", exc)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        if self.reader and self.reader.is_alive():
+            self.reader.join(timeout=1)
+
+
+def find_free_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
+
+
+class PresenterProcess:
+    def __init__(self, mode: str, debug: bool, on_event: Callable[[Dict], None], port: Optional[int] = None) -> None:
+        self.mode = mode
+        self.debug = debug
+        self.on_event = on_event
+        self.port = port or find_free_port()
+        self.process: Optional[subprocess.Popen] = None
+        self.bridge: Optional[BridgeClientBase] = None
+
+    def start(self) -> None:
+        script_path = Path(__file__).with_name("presenter.py")
+        debug_flag = "--debug" if self.debug else ""
+        env = os.environ.copy()
+        args = [sys.executable, str(script_path), "--bridge", self.mode, "--port", str(self.port)]
+        if self.debug:
+            args.append("--debug")
+        self.process = subprocess.Popen(args, env=env)
+        if self.mode == BRIDGE_WS:
+            self.bridge = WebSocketBridgeClient("127.0.0.1", self.port, self.on_event)
+        else:
+            self.bridge = HttpBridgeClient("127.0.0.1", self.port, self.on_event)
+        self.bridge.start()
+
+    def send(self, action: str, data: Optional[Dict] = None) -> None:
+        if not self.bridge:
+            return
+        self.bridge.send(action, data)
+
+    def stop(self) -> None:
+        if self.bridge:
+            try:
+                self.bridge.send("QUIT", {})
+            except Exception:  # pylint: disable=broad-except
+                pass
+            self.bridge.close()
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
 
 
 class QuizApp:
-    def __init__(self, quiz_path: str, debug: bool = False) -> None:
-        self.base_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    def __init__(self, quiz_path: str, bridge_mode: str, debug: bool = False, port: Optional[int] = None) -> None:
+        self.base_dir = Path(__file__).resolve().parent.parent
         os.chdir(self.base_dir)
         self.quiz_path = quiz_path
+        self.bridge_mode = bridge_mode
         self.questions = parse_quiz_file(self.quiz_path)
         if not self.questions:
             raise RuntimeError("No quiz questions found.")
         self.root = tk.Tk()
         self.root.title("Quiz Control")
-        self.main_thread = threading.current_thread()
-        self.ui_queue: queue.Queue = queue.Queue()
-        self.bridge = Bridge(self.ui_queue)
-        self.window: Optional[webview.Window] = None
-        self.webview_thread: Optional[threading.Thread] = None
-        self.webview_ready = False
-        self.presentation_ready = False
+        self.ui_queue: "queue.Queue[Tuple[str, Optional[Dict]]]" = queue.Queue()
+        self.debug_enabled = debug or os.environ.get("DEBUG") == "1"
+        self.debug_until = time.time() + 30 if self.debug_enabled else 0.0
+        self.presenter = PresenterProcess(bridge_mode, self.debug_enabled, self._handle_bridge_event, port=port)
+        self.presenter.start()
         self.current_question: Optional[QuizQuestion] = None
         self.current_status: Dict[str, int] = {"page": 1, "totalPages": 1, "phraseIndex": 0, "ttsQueue": 0}
-        self.executor = ThreadPoolExecutor(max_workers=2)
         self.tts_manager = TTSManager()
         self.voicevox_alerted = False
+        self.executor = ThreadPoolExecutor(max_workers=2)
         self.cps_var = tk.IntVar(value=14)
         self.pause_factor_var = tk.DoubleVar(value=1.0)
         self.zoom_var = tk.DoubleVar(value=1.10)
@@ -359,13 +540,10 @@ class QuizApp:
         self.phrase_var = tk.StringVar(value="-")
         self.queue_var = tk.StringVar(value="0")
         self.voicevox_var = tk.StringVar(value="未確認")
-        self.questions_listbox: Optional[tk.Listbox] = None
         self.answer_text = tk.StringVar(value="")
-        self.debug_enabled = debug or os.environ.get("DEBUG") == "1"
-        self.debug_until = time.time() + 30 if self.debug_enabled else 0.0
+        self.questions_listbox: Optional[tk.Listbox] = None
+        self.presentation_ready = False
         self.closing = False
-        if self.debug_enabled:
-            logging.info("Event flow debug logging enabled for 30 seconds.")
         self.create_control_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<space>", self.handle_stop_hotkey)
@@ -377,6 +555,7 @@ class QuizApp:
         self.root.bind("<Escape>", self.handle_escape)
         if self.questions:
             self.set_current_question(0)
+        self._drain_ui_queue()
 
     def _debug(self, message: str, *args: object) -> None:
         if not self.debug_enabled:
@@ -384,6 +563,9 @@ class QuizApp:
         if self.debug_until and time.time() > self.debug_until:
             return
         logging.debug("[thread:%s] " + message, threading.current_thread().name, *args)
+
+    def _handle_bridge_event(self, payload: Dict) -> None:
+        self.ui_queue.put((payload.get("action", ""), payload.get("data")))
 
     def create_control_ui(self) -> None:
         main_frame = ttk.Frame(self.root, padding=12)
@@ -437,82 +619,186 @@ class QuizApp:
 
         ttk.Label(status_frame, text="ページ").grid(row=0, column=0, sticky=tk.W)
         ttk.Label(status_frame, textvariable=self.page_var).grid(row=0, column=1, sticky=tk.W)
-
         ttk.Label(status_frame, text="フレーズ").grid(row=1, column=0, sticky=tk.W)
         ttk.Label(status_frame, textvariable=self.phrase_var).grid(row=1, column=1, sticky=tk.W)
-
         ttk.Label(status_frame, text="TTSキュー").grid(row=2, column=0, sticky=tk.W)
         ttk.Label(status_frame, textvariable=self.queue_var).grid(row=2, column=1, sticky=tk.W)
-
         ttk.Label(status_frame, text="VOICEVOX").grid(row=3, column=0, sticky=tk.W)
         ttk.Label(status_frame, textvariable=self.voicevox_var).grid(row=3, column=1, sticky=tk.W)
 
         answer_frame = ttk.LabelFrame(right, text="正解")
         answer_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        ttk.Label(answer_frame, textvariable=self.answer_text, wraplength=280, justify=tk.LEFT).pack(anchor=tk.W, padx=4, pady=4)
+        ttk.Label(answer_frame, textvariable=self.answer_text, wraplength=260, justify=tk.LEFT).pack(fill=tk.BOTH, expand=True)
 
-    def _on_ui_thread(self) -> bool:
-        return threading.current_thread() is self.main_thread
+    def _drain_ui_queue(self) -> None:
+        try:
+            while True:
+                event, payload = self.ui_queue.get_nowait()
+                self._debug("dispatch %s", event)
+                self._handle_event(event, payload)
+        except queue.Empty:
+            pass
+        if not self.closing:
+            self.root.after(50, self._drain_ui_queue)
 
-    def post_ui_event(self, event: str, payload: Optional[Dict] = None) -> None:
-        self._debug("queue %s", event)
-        self.ui_queue.put((event, payload))
+    def _handle_event(self, event: str, payload: Optional[Dict]) -> None:
+        if event == "READY":
+            self.on_presentation_ready()
+        elif event == "STATUS":
+            if isinstance(payload, dict):
+                self.update_status(payload)
+        elif event == "TTS_REQUEST":
+            if isinstance(payload, dict):
+                self.handle_tts_request(payload)
+        elif event == "ERROR":
+            logging.error("Presentation error: %s", payload)
+        elif event == "FINISHED":
+            messagebox.showinfo("情報", "プレゼンテーションが終了しました。")
+        elif event == "PONG":
+            pass
+        elif event == "VOICEVOX_UNAVAILABLE":
+            if self.voicevox_alerted:
+                messagebox.showwarning("VOICEVOX", "VOICEVOX が起動していない可能性があります。")
 
-    def on_select_question(self, _event: object) -> None:
-        if not self.questions_listbox:
+    def on_presentation_ready(self) -> None:
+        if self.presentation_ready:
             return
-        selection = self.questions_listbox.curselection()
-        if not selection:
-            return
-        index = selection[0]
-        self.set_current_question(index, ensure_selection=False)
+        self.presentation_ready = True
+        available = self.tts_manager.check_service()
+        if available:
+            self.voicevox_var.set("起動中")
+            self.voicevox_alerted = False
+        else:
+            self.voicevox_var.set("未起動")
+            self.voicevox_alerted = True
+        if self.current_question is None and self.questions:
+            self.set_current_question(0)
+        self.sync_current_settings()
 
-    def set_current_question(self, index: int, *, ensure_selection: bool = True) -> None:
-        if index < 0 or index >= len(self.questions):
-            return
-        if not self._on_ui_thread():
-            self.post_ui_event("SELECT_QUESTION", {"index": index, "ensure_selection": ensure_selection})
-            return
-        self._apply_question_selection(index, ensure_selection=ensure_selection)
+    def update_status(self, payload: Dict[str, int]) -> None:
+        page = payload.get("page", 1)
+        total = payload.get("totalPages", 1)
+        phrase = payload.get("phraseIndex", 0)
+        queue_len = payload.get("ttsQueue", 0)
+        self.current_status = payload
+        self.page_var.set(f"{page}/{total}")
+        self.phrase_var.set(str(phrase))
+        self.queue_var.set(str(queue_len))
 
-    def _apply_question_selection(self, index: int, *, ensure_selection: bool = True) -> None:
-        if index < 0 or index >= len(self.questions):
+    def handle_tts_request(self, payload: Dict) -> None:
+        slices = payload.get("slice")
+        if not isinstance(slices, list) or not self.current_question:
             return
-        self.current_question = self.questions[index]
-        answers = " / ".join(self.current_question.answers)
-        self.answer_text.set(answers)
-        if ensure_selection and self.questions_listbox:
-            self.questions_listbox.selection_clear(0, tk.END)
-            self.questions_listbox.selection_set(index)
-            self.questions_listbox.see(index)
-        self._sync_current_question()
+        question = self.current_question
 
-    def _sync_current_question(self) -> None:
-        if not (self.presentation_ready and self.webview_ready):
-            return
-        if not self.current_question:
-            return
-        payload = self.build_question_payload(self.current_question)
-        self.send_command("load_question", payload)
-        self.send_command("set_cps", {"value": self.cps_var.get()})
-        self.send_command("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
-        self.send_command("set_zoom", {"value": round(self.zoom_var.get(), 2)})
-        self.send_command("set_compact", {"value": bool(self.compact_var.get())})
+        def worker() -> None:
+            chunks = []
+            for item in slices:
+                start = int(item.get("startChar", 0))
+                end = int(item.get("endChar", 0))
+                segments = question.get_tts_segments(start, end)
+                texts = []
+                for text, is_kana in segments:
+                    if len(text) > MAX_CHARS_PER_TTS:
+                        for idx in range(0, len(text), MAX_CHARS_PER_TTS):
+                            texts.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
+                    else:
+                        texts.append((text, is_kana))
+                for text, is_kana in texts:
+                    wav = self.tts_manager.synthesize(text, is_kana=is_kana)
+                    if wav:
+                        chunk_id = f"chunk-{len(chunks)}"
+                        chunks.append({"id": chunk_id, "wavBase64": wav})
+            if chunks:
+                for chunk in chunks:
+                    self.presenter.send("play_chunk", chunk)
+            elif not self.voicevox_alerted:
+                self.voicevox_alerted = True
+                self.ui_queue.put(("VOICEVOX_UNAVAILABLE", None))
 
-    def build_question_payload(self, question: QuizQuestion) -> Dict:
+        self.executor.submit(worker)
+
+    def create_question_payload(self, question: QuizQuestion) -> Dict:
         return {
             "id": question.identifier,
-            "title": question.title,
             "text": question.display_text,
             "answers": question.answers,
             "explain": question.explain,
         }
 
+    def sync_current_settings(self) -> None:
+        if not self.presentation_ready or not self.current_question:
+            return
+        self.presenter.send("load_question", self.create_question_payload(self.current_question))
+        self.presenter.send("set_cps", {"value": self.cps_var.get()})
+        self.presenter.send("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
+        self.presenter.send("set_zoom", {"value": round(self.zoom_var.get(), 2)})
+        self.presenter.send("set_compact", {"value": bool(self.compact_var.get())})
+
+    def set_current_question(self, index: int) -> None:
+        if index < 0 or index >= len(self.questions):
+            return
+        self.current_question = self.questions[index]
+        answers = " / ".join(self.current_question.answers)
+        self.answer_text.set(answers)
+        if self.questions_listbox:
+            self.questions_listbox.select_clear(0, tk.END)
+            self.questions_listbox.select_set(index)
+            self.questions_listbox.activate(index)
+        self.sync_current_settings()
+
+    def on_select_question(self, event) -> None:
+        if not self.questions_listbox:
+            return
+        selection = self.questions_listbox.curselection()
+        if selection:
+            self.set_current_question(selection[0])
+
+    def start_presentation(self) -> None:
+        if not self.presentation_ready or not self.current_question:
+            messagebox.showwarning("未接続", "プレゼン画面が未接続です。")
+            return
+        self.presenter.send("start", {})
+
+    def stop_presentation(self, reason: str) -> None:
+        if not self.presentation_ready:
+            return
+        self.presenter.send("stop_all", {"reason": reason})
+
+    def resume_presentation(self) -> None:
+        if not self.presentation_ready:
+            return
+        self.presenter.send("resume", {})
+
+    def reveal_answer(self) -> None:
+        if not self.presentation_ready:
+            return
+        self.presenter.send("reveal_answer", {})
+
+    def update_cps(self) -> None:
+        value = max(10, min(18, self.cps_var.get()))
+        self.cps_var.set(value)
+        if self.presentation_ready:
+            self.presenter.send("set_cps", {"value": value})
+
+    def update_pause_factor(self) -> None:
+        value = max(0.8, min(1.4, float(self.pause_factor_var.get())))
+        self.pause_factor_var.set(value)
+        if self.presentation_ready:
+            self.presenter.send("set_pause_factor", {"value": round(value, 2)})
+
+    def update_zoom(self) -> None:
+        value = max(0.85, min(1.4, float(self.zoom_var.get())))
+        self.zoom_var.set(value)
+        if self.presentation_ready:
+            self.presenter.send("set_zoom", {"value": round(value, 2)})
+
+    def update_compact(self) -> None:
+        if self.presentation_ready:
+            self.presenter.send("set_compact", {"value": bool(self.compact_var.get())})
+
     def load_quiz_file(self) -> None:
-        file_path = filedialog.askopenfilename(
-            title="クイズファイルを選択",
-            filetypes=[("Quiz text", "*.txt"), ("All files", "*.*")],
-        )
+        file_path = filedialog.askopenfilename(filetypes=[("Quiz", "*.txt"), ("All", "*.*")])
         if not file_path:
             return
         try:
@@ -524,325 +810,72 @@ class QuizApp:
             messagebox.showinfo("情報", "問題が見つかりませんでした。")
             return
         self.questions = new_questions
-        self._repopulate_question_listbox()
+        if self.questions_listbox:
+            self.questions_listbox.delete(0, tk.END)
+            for idx, question in enumerate(self.questions):
+                title = question.title or f"Question {idx + 1}"
+                self.questions_listbox.insert(tk.END, f"{idx + 1}: {title}")
         self.set_current_question(0)
 
-    def _repopulate_question_listbox(self) -> None:
-        if not self.questions_listbox:
-            return
-        self.questions_listbox.delete(0, tk.END)
-        for idx, question in enumerate(self.questions):
-            title = question.title or f"Question {idx + 1}"
-            self.questions_listbox.insert(tk.END, f"{idx + 1}: {title}")
-
-    def start_presentation(self) -> None:
-        if not self.presentation_ready:
-            messagebox.showwarning("未接続", "プレゼン画面が未接続です。")
-            return
-        if not self.current_question:
-            self.set_current_question(0)
-        if not self.current_question:
-            return
-        self.send_command("load_question", self.build_question_payload(self.current_question))
-        self.send_command("set_cps", {"value": self.cps_var.get()})
-        self.send_command("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
-        self.send_command("set_zoom", {"value": round(self.zoom_var.get(), 2)})
-        self.send_command("set_compact", {"value": bool(self.compact_var.get())})
-        self.send_command("start", {"fromPage": max(self.current_status.get("page", 1) - 1, 0)})
-
-    def stop_presentation(self, reason: str) -> None:
-        if not self.presentation_ready:
-            return
-        self.send_command("stop_all", {"reason": reason})
-        self.send_command("flush_audio", {})
-
-    def resume_presentation(self) -> None:
-        if not self.presentation_ready:
-            return
-        self.send_command("resume", {})
-
-    def reveal_answer(self) -> None:
-        if not self.presentation_ready:
-            return
-        self.send_command("reveal_answer", {})
-
-    def update_cps(self) -> None:
-        value = max(10, min(18, self.cps_var.get()))
-        self.cps_var.set(value)
-        if self.presentation_ready:
-            self.send_command("set_cps", {"value": value})
-
-    def update_pause_factor(self) -> None:
-        value = max(0.8, min(1.4, float(self.pause_factor_var.get())))
-        self.pause_factor_var.set(value)
-        if self.presentation_ready:
-            self.send_command("set_pause_factor", {"value": round(value, 2)})
-
-    def update_zoom(self) -> None:
-        value = max(0.85, min(1.4, float(self.zoom_var.get())))
-        self.zoom_var.set(value)
-        if self.presentation_ready:
-            self.send_command("set_zoom", {"value": round(value, 2)})
-
-    def update_compact(self) -> None:
-        if self.presentation_ready:
-            self.send_command("set_compact", {"value": bool(self.compact_var.get())})
-
-    def on_presentation_ready(self) -> None:
-        if self.presentation_ready:
-            self._debug("presentation bridge already initialized")
-            return
-        self.presentation_ready = True
-        self._debug("presentation bridge ready")
-        self.voicevox_var.set("確認中")
-        available = self.tts_manager.check_service()
-        if available:
-            self.voicevox_var.set("起動中")
-            self.voicevox_alerted = False
-        else:
-            self.voicevox_var.set("未起動")
-            self.voicevox_alerted = True
-        if self.questions and self.current_question is None:
-            self.set_current_question(0)
-        self._sync_current_question()
-
-    def _drain_ui_queue(self) -> None:
-        try:
-            while True:
-                event, payload = self.ui_queue.get_nowait()
-                self._debug("dispatch %s", event)
-                self._handle_ui_event(event, payload)
-        except queue.Empty:
-            pass
-        if self.closing:
-            return
-        try:
-            self.root.after(50, self._drain_ui_queue)
-        except tk.TclError:
-            pass
-
-    def _handle_ui_event(self, event: str, payload: Optional[Dict]) -> None:
-        if event == "WEBVIEW_READY":
-            self._on_webview_ready_mainthread()
-        elif event == "PRESENTATION_READY":
-            self.on_presentation_ready()
-        elif event == "TTS_REQUEST":
-            if isinstance(payload, dict):
-                self.handle_tts_request(payload)
-        elif event == "STATUS":
-            if isinstance(payload, dict):
-                self.update_status(payload)
-        elif event == "ERROR":
-            logging.error("Presentation error: %s", payload)
-        elif event == "PLAY_CHUNK":
-            if isinstance(payload, dict):
-                self.send_command("play_chunk", payload)
-        elif event == "VOICEVOX_UNAVAILABLE":
-            self._handle_voicevox_unavailable()
-        elif event == "SELECT_QUESTION":
-            if isinstance(payload, dict) and "index" in payload:
-                ensure = bool(payload.get("ensure_selection", True))
-                try:
-                    index = int(payload.get("index"))
-                except (TypeError, ValueError):
-                    return
-                self._apply_question_selection(index, ensure_selection=ensure)
-        elif event == "QUIT":
-            self.on_close()
-
-    def _on_webview_ready_mainthread(self) -> None:
-        if self.webview_ready:
-            return
-        self.webview_ready = True
-        self._debug("webview ready acknowledged")
-        self._sync_current_question()
-
-    def _handle_voicevox_unavailable(self) -> None:
-        if self.voicevox_alerted:
-            return
-        self.voicevox_alerted = True
-        self.voicevox_var.set("未起動")
-        logging.warning("VOICEVOX is not available. Proceeding silently.")
-
-    def handle_tts_request(self, payload: Optional[Dict[str, List[Dict[str, int]]]]) -> None:
-        if not self.current_question or not payload:
-            return
-        slices = payload.get("slice", [])
-        for item in slices:
-            start = item.get("start")
-            end = item.get("end")
-            chunk_id = item.get("id")
-            if start is None or end is None or chunk_id is None:
-                continue
-            segments = self.current_question.get_tts_segments(start, end)
-            if not segments:
-                text = self.current_question.display_text[start:end]
-                segments = [(text, False)]
-            sub_index = 0
-            for text, is_kana in segments:
-                for part in self.split_for_limits(text):
-                    actual_id = f"{chunk_id}:{sub_index}"
-                    sub_index += 1
-                    self.executor.submit(self.generate_chunk, actual_id, part, is_kana)
-
-    def split_for_limits(self, text: str) -> List[str]:
-        if len(text) <= MAX_CHARS_PER_TTS:
-            return [text]
-        parts: List[str] = []
-        buffer = ""
-        for char in text:
-            buffer += char
-            if len(buffer) >= MAX_CHARS_PER_TTS:
-                parts.append(buffer)
-                buffer = ""
-        if buffer:
-            parts.append(buffer)
-        return parts
-
-    def generate_chunk(self, chunk_id: str, text: str, is_kana: bool) -> None:
-        audio = self.tts_manager.synthesize(text, is_kana=is_kana)
-        if audio:
-            self.post_ui_event("PLAY_CHUNK", {"id": chunk_id, "wavBase64": audio})
-        elif not self.tts_manager.check_service():
-            self.post_ui_event("VOICEVOX_UNAVAILABLE")
-        else:
-            self._debug("No audio generated for chunk %s", chunk_id)
-
-    def update_status(self, payload: Dict[str, int]) -> None:
-        self.current_status.update(payload)
-        page = payload.get("page", 1)
-        total = payload.get("totalPages", 1)
-        self.page_var.set(f"{page} / {total}")
-        phrase = payload.get("phraseIndex", 0)
-        self.phrase_var.set(str(phrase))
-        queue_len = payload.get("ttsQueue", 0)
-        self.queue_var.set(str(queue_len))
-
-    def send_command(self, action: str, data: Dict) -> None:
-        if not self.window or not self.webview_ready:
-            self._debug("skip %s (webview not ready)", action)
-            return
-        message = json.dumps({"action": action, "data": data}, ensure_ascii=False)
-        script = f"window.appBridge && window.appBridge.receive({message});"
-        self._debug("send %s", action)
-        try:
-            self.window.evaluate_js(script)
-        except Exception as exc:  # pylint: disable=broad-except
-            logging.error("Failed to send command %s: %s", action, exc)
-
-    def handle_stop_hotkey(self, _event: tk.Event) -> str:
+    def handle_stop_hotkey(self, event) -> None:  # type: ignore[override]
+        del event
         self.stop_presentation("hotkey")
-        return "break"
 
-    def handle_resume_hotkey(self, _event: tk.Event) -> str:
+    def handle_resume_hotkey(self, event) -> None:  # type: ignore[override]
+        del event
         self.resume_presentation()
-        return "break"
 
-    def handle_reveal_hotkey(self, _event: tk.Event) -> str:
+    def handle_reveal_hotkey(self, event) -> None:  # type: ignore[override]
+        del event
         self.reveal_answer()
-        return "break"
 
-    def handle_page_down(self, _event: tk.Event) -> str:
-        if not self.presentation_ready:
-            return "break"
-        page = self.current_status.get("page", 1)
-        total = self.current_status.get("totalPages", 1)
-        if page < total:
-            self.send_command("goto_page", {"page": page})
-        return "break"
+    def handle_page_down(self, event) -> None:  # type: ignore[override]
+        del event
+        current = max(self.current_status.get("page", 1) - 1, 0)
+        total = max(self.current_status.get("totalPages", 1), 1)
+        next_page = min(current + 1, total - 1)
+        self.presenter.send("goto_page", {"page": next_page})
 
-    def handle_page_up(self, _event: tk.Event) -> str:
-        if not self.presentation_ready:
-            return "break"
-        page = self.current_status.get("page", 1)
-        if page > 1:
-            self.send_command("goto_page", {"page": page - 2})
-        return "break"
+    def handle_page_up(self, event) -> None:  # type: ignore[override]
+        del event
+        current = max(self.current_status.get("page", 1) - 1, 0)
+        prev_page = max(current - 1, 0)
+        self.presenter.send("goto_page", {"page": prev_page})
 
-    def handle_escape(self, _event: tk.Event) -> str:
-        self.on_close()
-        return "break"
+    def handle_escape(self, event) -> None:  # type: ignore[override]
+        del event
+        self.stop_presentation("escape")
 
     def on_close(self) -> None:
-        if self.closing:
-            return
         self.closing = True
+        self.presenter.stop()
         try:
-            self.executor.shutdown(wait=False, cancel_futures=True)
-        except TypeError:
             self.executor.shutdown(wait=False)
-        if self.window:
-            try:
-                webview.destroy_window(self.window)
-            except Exception:  # pylint: disable=broad-except
-                pass
-            self.window = None
-        try:
-            self.root.quit()
-        except tk.TclError:
+        except Exception:  # pylint: disable=broad-except
             pass
-        try:
-            self.root.destroy()
-        except tk.TclError:
-            pass
+        self.root.destroy()
 
     def run(self) -> None:
-        index_uri = (Path(self.base_dir) / "web" / "index.html").resolve().as_uri()
-        backend = select_webview_gui()
-        backend_label = backend or "default"
-        logging.info("Using pywebview GUI backend: %s", backend_label)
-        if self.debug_enabled:
-            self._debug("webview start backend=%s url=%s", backend_label, index_uri)
-        self.window = webview.create_window(
-            "Quiz Presentation",
-            url=index_uri,
-            js_api=self.bridge,
-            width=1600,
-            height=900,
-            resizable=True,
-            confirm_close=True,
-        )
-        if hasattr(self.window, "events") and hasattr(self.window.events, "closed"):
-            self.window.events.closed += self._on_webview_closed
-
-        def launch_webview() -> None:
-            start_kwargs = {"debug": self.debug_enabled}
-            if backend:
-                start_kwargs["gui"] = backend
-            try:
-                webview.start(self._on_webview_ready_webview, **start_kwargs)
-            except Exception as exc:  # pylint: disable=broad-except
-                logging.error("pywebview failed to start: %s", exc)
-                self.post_ui_event("ERROR", {"code": "webview_start", "message": str(exc)})
-
-        self.webview_thread = threading.Thread(target=launch_webview, name="WebviewThread", daemon=True)
-        self.webview_thread.start()
-        self._drain_ui_queue()
-        try:
-            self.root.mainloop()
-        finally:
-            self.closing = True
-
-    def _on_webview_ready_webview(self) -> None:
-        self.post_ui_event("WEBVIEW_READY")
-
-    def _on_webview_closed(self) -> None:
-        self.post_ui_event("QUIT")
+        self.root.mainloop()
 
 
-def main() -> None:
-    base_dir = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
-    default_quiz = os.path.join(base_dir, "samples", "sample.quiz.txt")
-    parser = argparse.ArgumentParser(description="Quiz presentation control app")
-    parser.add_argument("--quiz", default=default_quiz, help="Path to quiz file (default: samples/sample.quiz.txt)")
-    parser.add_argument("--debug", action="store_true", help="Enable event flow debug logging for 30 seconds")
-    args = parser.parse_args()
-    debug_env = os.environ.get("DEBUG") == "1"
-    log_level = logging.DEBUG if args.debug or debug_env else logging.INFO
-    logging.basicConfig(level=log_level, format="[%(levelname)s] %(message)s")
-    quiz_path = args.quiz or default_quiz
-    app = QuizApp(quiz_path, debug=args.debug or debug_env)
-    app.run()
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Quiz control application")
+    parser.add_argument("quiz", nargs="?", default="samples/sample.quiz.txt")
+    parser.add_argument("--bridge", choices=[BRIDGE_WS, BRIDGE_HTTP], default=BRIDGE_WS)
+    parser.add_argument("--port", type=int, help="Bridge server port (optional)")
+    parser.add_argument("--debug", action="store_true")
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv or sys.argv[1:])
+    logging.basicConfig(level=logging.DEBUG if args.debug or os.environ.get("DEBUG") == "1" else logging.INFO)
+    app = QuizApp(args.quiz, args.bridge, debug=args.debug, port=args.port)
+    try:
+        app.run()
+    finally:
+        app.presenter.stop()
 
 
 if __name__ == "__main__":
