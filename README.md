@@ -86,6 +86,7 @@ python app/main.py --bridge ws --port 8765
 - `--port` を指定しない場合は、利用可能なポートが自動で割り当てられます。特定のポートを開放済みで固定運用したい場合にだけ明示的に指定してください。
 - Windows で WebView2 ランタイムが未導入の場合は Microsoft Edge WebView2 ランタイムをインストールしてください。`PYWEBVIEW_GUI=edgechromium` を指定すると Edge バックエンドを強制できます。
 - `python app/main.py --debug` または `DEBUG=1 python app/main.py` を指定すると、起動から 30 秒間はブリッジ接続やイベントの詳細ログを INFO レベルに出力します。子プロセス側で `--debug` を付与（親から自動で継承）すると、プレゼン側でもバックエンド名や `index.html` の絶対パスを記録します。
+- VOICEVOX エンジンが起動していない状態で開始しても、アプリは 10 秒間隔でサービスの再検出を行います。後から VOICEVOX を立ち上げた場合でも再度「開始」を押せば接続できます。
 
 - **コントロール画面**（Tkinter）と **プレゼン画面**（pywebview）の 2 つのウィンドウが開きます。
 - 初期状態では `samples/sample.quiz.txt` を読み込みます。別ファイルを利用する場合は「クイズを開く」ボタンから選択してください。

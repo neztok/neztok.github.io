@@ -242,16 +242,25 @@ class TTSManager:
         self.available: Optional[bool] = None
         self.warning_displayed = False
         self.lock = threading.Lock()
+        self._last_check = 0.0
+        self._retry_interval = 10.0
 
     def check_service(self) -> bool:
+        if self.available is True:
+            return True
         with self.lock:
             if self.available is True:
                 return True
+            now = time.monotonic()
+            if self.available is False and (now - self._last_check) < self._retry_interval:
+                return False
             try:
                 response = self.session.get(f"{VOICEVOX_URL}/version", timeout=2)
                 self.available = response.ok
             except requests.RequestException:
                 self.available = False
+            finally:
+                self._last_check = now
             return self.available
 
     def synthesize(self, text: str, is_kana: bool = False) -> Optional[str]:

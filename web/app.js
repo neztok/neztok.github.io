@@ -39,6 +39,8 @@ function createWebSocketBridge(url) {
   let socket = null;
   let ready = false;
   const queue = [];
+  let manualClose = false;
+  let reconnectTimer = null;
 
   function notifyOpen() {
     ready = true;
@@ -62,6 +64,9 @@ function createWebSocketBridge(url) {
   }
 
   function connect(delay = 0) {
+    if (manualClose) {
+      return;
+    }
     if (socket) {
       try {
         socket.close();
@@ -69,7 +74,13 @@ function createWebSocketBridge(url) {
         // ignore close errors
       }
     }
-    setTimeout(() => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+    }
+    reconnectTimer = setTimeout(() => {
+      if (manualClose) {
+        return;
+      }
       socket = new WebSocket(url);
       socket.onopen = () => {
         const pending = queue.splice(0);
@@ -90,7 +101,9 @@ function createWebSocketBridge(url) {
       };
       socket.onclose = () => {
         ready = false;
-        connect(500);
+        if (!manualClose) {
+          connect(500);
+        }
       };
     }, delay);
   }
@@ -119,6 +132,23 @@ function createWebSocketBridge(url) {
         }
       }
     },
+    close() {
+      manualClose = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      listeners.clear();
+      openListeners.clear();
+      if (socket) {
+        try {
+          socket.close();
+        } catch (err) {
+          // ignore
+        }
+        socket = null;
+      }
+    },
   };
 }
 
@@ -126,6 +156,8 @@ function createHttpBridge(baseUrl) {
   const listeners = new Set();
   const openListeners = new Set();
   let source = null;
+  let manualClose = false;
+  let reconnectTimer = null;
 
   function notifyOpen() {
     openListeners.forEach((cb) => {
@@ -148,6 +180,9 @@ function createHttpBridge(baseUrl) {
   }
 
   function connect(delay = 0) {
+    if (manualClose) {
+      return;
+    }
     if (source) {
       try {
         source.close();
@@ -155,7 +190,13 @@ function createHttpBridge(baseUrl) {
         // ignore
       }
     }
-    setTimeout(() => {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+    }
+    reconnectTimer = setTimeout(() => {
+      if (manualClose) {
+        return;
+      }
       source = new EventSource(`${baseUrl}/api/presentation/events`, { withCredentials: false });
       source.onopen = () => {
         notifyOpen();
@@ -169,7 +210,9 @@ function createHttpBridge(baseUrl) {
         } catch (err) {
           // ignore
         }
-        connect(1000);
+        if (!manualClose) {
+          connect(1000);
+        }
       };
     }, delay);
   }
@@ -198,6 +241,23 @@ function createHttpBridge(baseUrl) {
         openListeners.add(callback);
       }
     },
+    close() {
+      manualClose = true;
+      if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+      }
+      listeners.clear();
+      openListeners.clear();
+      if (source) {
+        try {
+          source.close();
+        } catch (err) {
+          // ignore
+        }
+        source = null;
+      }
+    },
   };
 }
 
@@ -220,6 +280,19 @@ function ensureBridge() {
     });
   }
   return bridgeConnection;
+}
+
+function closeBridgeConnection() {
+  if (bridgeConnection && typeof bridgeConnection.close === 'function') {
+    try {
+      bridgeConnection.close();
+    } catch (err) {
+      console.error('bridge close failed', err);
+    }
+  }
+  bridgeConnection = null;
+  bridgeReceiver = null;
+  pendingBridgeMessages = [];
 }
 
 function setBridgeReceiver(handler) {
@@ -901,4 +974,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
 window.addEventListener('error', (event) => {
   reportError('runtime_error', event.error || event.message);
+});
+
+window.addEventListener('beforeunload', () => {
+  closeBridgeConnection();
 });
