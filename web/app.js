@@ -15,6 +15,8 @@ const state = {
   running: false,
   phraseIndex: 0,
   requestedChunks: new Set(),
+  ttsControllers: new Map(),
+  currentAudioId: null,
   autoScroll: false,
   statusHint: '',
 };
@@ -216,6 +218,28 @@ function updateScroll(page) {
   elements.contentShell.scrollTop = maxScroll * ratio;
 }
 
+function cancelAllTtsRequests() {
+  for (const controller of state.ttsControllers.values()) {
+    try {
+      controller.abort();
+    } catch (err) {
+      // Ignore abort errors
+    }
+  }
+  state.ttsControllers.clear();
+}
+
+function resetTtsPrefetch(options = {}) {
+  const { flushAudio = false } = options;
+  if (flushAudio) {
+    audioManager.flush();
+  }
+  cancelAllTtsRequests();
+  state.requestedChunks.clear();
+  state.currentAudioId = null;
+  scheduleStatus();
+}
+
 function requestAudioForUpcoming() {
   const page = currentPage();
   if (!page || !window.pywebview?.api?.request_tts_chunks) return;
@@ -228,15 +252,31 @@ function requestAudioForUpcoming() {
     const chunkId = `${state.pageIndex}-${index}`;
     if (state.requestedChunks.has(chunkId)) continue;
     state.requestedChunks.add(chunkId);
-    window.pywebview.api.request_tts_chunks({
-      slice: [
-        {
-          id: chunkId,
-          start: page.start + phrase.start,
-          end: page.start + phrase.end,
-        },
-      ],
-    }).catch((err) => reportError('tts_request_failed', err));
+    const controller = new AbortController();
+    state.ttsControllers.set(chunkId, controller);
+    Promise.resolve(
+      window.pywebview.api.request_tts_chunks({
+        slice: [
+          {
+            id: chunkId,
+            start: page.start + phrase.start,
+            end: page.start + phrase.end,
+          },
+        ],
+      })
+    )
+      .catch((err) => {
+        if (!controller.signal.aborted) {
+          state.requestedChunks.delete(chunkId);
+          reportError('tts_request_failed', err);
+        }
+      })
+      .finally(() => {
+        const existing = state.ttsControllers.get(chunkId);
+        if (existing === controller) {
+          state.ttsControllers.delete(chunkId);
+        }
+      });
   }
 }
 
@@ -342,6 +382,7 @@ const audioManager = {
     if (!ctx) return;
     const next = this.queue.shift();
     if (!next) {
+      state.currentAudioId = null;
       scheduleStatus();
       return;
     }
@@ -351,15 +392,18 @@ const audioManager = {
     source.onended = () => {
       this.playing = false;
       this.currentSource = null;
+      state.currentAudioId = null;
       this.playNext();
     };
     this.currentSource = source;
     this.playing = true;
+    state.currentAudioId = next.id || null;
     try {
       source.start();
     } catch (err) {
       this.playing = false;
       this.currentSource = null;
+      state.currentAudioId = null;
       reportError('audio_start_failed', err);
     }
     scheduleStatus();
@@ -368,6 +412,7 @@ const audioManager = {
   flush() {
     this.stopCurrent();
     this.queue = [];
+    state.currentAudioId = null;
     scheduleStatus();
   },
 
@@ -382,6 +427,7 @@ const audioManager = {
       this.currentSource = null;
       this.playing = false;
     }
+    state.currentAudioId = null;
   },
 
   queueLength() {
@@ -505,10 +551,7 @@ async function setPage(index, options = {}) {
   typewriter.stop();
   state.typedLength = 0;
   state.phraseIndex = 0;
-  state.requestedChunks.clear();
-  if (options.flushAudio !== false) {
-    audioManager.flush();
-  }
+  resetTtsPrefetch({ flushAudio: options.flushAudio !== false });
   if (elements.content) {
     elements.content.textContent = '';
   }
@@ -547,17 +590,18 @@ const handlers = {
   async start(data = {}) {
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     await setPage(fromPage, { flushAudio: true });
+    requestAudioForUpcoming();
     typewriter.start(0);
   },
 
   stop_all() {
     typewriter.stop(true);
-    audioManager.flush();
+    resetTtsPrefetch({ flushAudio: true });
     setStatusHint('停止中');
-    scheduleStatus();
   },
 
   resume() {
+    requestAudioForUpcoming();
     typewriter.resume();
   },
 
@@ -571,6 +615,8 @@ const handlers = {
     if (typeof data.value === 'number') {
       state.cps = data.value;
       updateSettingsHint();
+      resetTtsPrefetch({ flushAudio: true });
+      requestAudioForUpcoming();
     }
   },
 
@@ -578,6 +624,8 @@ const handlers = {
     if (typeof data.value === 'number') {
       state.pauseFactor = data.value;
       updateSettingsHint();
+      resetTtsPrefetch({ flushAudio: true });
+      requestAudioForUpcoming();
     }
   },
 
@@ -602,7 +650,7 @@ const handlers = {
   },
 
   flush_audio() {
-    audioManager.flush();
+    resetTtsPrefetch({ flushAudio: true });
   },
 };
 
@@ -625,9 +673,12 @@ window.appBridge = {
 
 function notifyReady() {
   if (readyNotified) return;
-  if (!window.pywebview?.api?.notify_ready) return;
+  const api = window.pywebview?.api;
+  if (!api) return;
+  const invoke = api.ready || api.notify_ready;
+  if (!invoke) return;
   readyNotified = true;
-  window.pywebview.api.notify_ready().catch(() => {
+  Promise.resolve(invoke.call(api)).catch(() => {
     readyNotified = false;
   });
 }

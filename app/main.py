@@ -12,6 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+from pathlib import Path
+
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -301,25 +303,30 @@ class TTSManager:
             return None
 
 
-class PresentationBridge:
-    def __init__(self, app: "QuizApp") -> None:
-        self.app = app
+class Bridge:
+    __slots__ = ("ui_queue",)
+
+    def __init__(self, ui_queue: "queue.Queue") -> None:
+        self.ui_queue = ui_queue
+
+    def _emit(self, event: str, payload: Optional[Dict] = None) -> bool:
+        self.ui_queue.put((event, payload))
+        return True
+
+    def ready(self) -> bool:
+        return self._emit("PRESENTATION_READY")
 
     def notify_ready(self) -> bool:
-        self.app.post_ui_event("PRESENTATION_READY")
-        return True
+        return self.ready()
 
     def request_tts_chunks(self, payload: Dict[str, List[Dict[str, int]]]) -> bool:
-        self.app.post_ui_event("TTS_REQUEST", payload)
-        return True
+        return self._emit("TTS_REQUEST", payload)
 
     def status(self, payload: Dict[str, int]) -> bool:
-        self.app.post_ui_event("STATUS", payload)
-        return True
+        return self._emit("STATUS", payload)
 
     def error(self, payload: Dict[str, str]) -> bool:
-        self.app.post_ui_event("ERROR", payload)
-        return True
+        return self._emit("ERROR", payload)
 
 
 class QuizApp:
@@ -333,13 +340,14 @@ class QuizApp:
         self.root = tk.Tk()
         self.root.title("Quiz Control")
         self.main_thread = threading.current_thread()
-        self.bridge = PresentationBridge(self)
+        self.ui_queue: queue.Queue = queue.Queue()
+        self.bridge = Bridge(self.ui_queue)
         self.window: Optional[webview.Window] = None
+        self.webview_thread: Optional[threading.Thread] = None
         self.webview_ready = False
         self.presentation_ready = False
         self.current_question: Optional[QuizQuestion] = None
         self.current_status: Dict[str, int] = {"page": 1, "totalPages": 1, "phraseIndex": 0, "ttsQueue": 0}
-        self.ui_queue: queue.Queue = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.tts_manager = TTSManager()
         self.voicevox_alerted = False
@@ -355,6 +363,7 @@ class QuizApp:
         self.answer_text = tk.StringVar(value="")
         self.debug_enabled = debug or os.environ.get("DEBUG") == "1"
         self.debug_until = time.time() + 30 if self.debug_enabled else 0.0
+        self.closing = False
         if self.debug_enabled:
             logging.info("Event flow debug logging enabled for 30 seconds.")
         self.create_control_ui()
@@ -366,7 +375,6 @@ class QuizApp:
         self.root.bind("<Next>", self.handle_page_down)
         self.root.bind("<Prior>", self.handle_page_up)
         self.root.bind("<Escape>", self.handle_escape)
-        self.root.after(50, self._drain_ui_queue)
         if self.questions:
             self.set_current_question(0)
 
@@ -606,7 +614,12 @@ class QuizApp:
                 self._handle_ui_event(event, payload)
         except queue.Empty:
             pass
-        self.root.after(50, self._drain_ui_queue)
+        if self.closing:
+            return
+        try:
+            self.root.after(50, self._drain_ui_queue)
+        except tk.TclError:
+            pass
 
     def _handle_ui_event(self, event: str, payload: Optional[Dict]) -> None:
         if event == "WEBVIEW_READY":
@@ -634,6 +647,8 @@ class QuizApp:
                 except (TypeError, ValueError):
                     return
                 self._apply_question_selection(index, ensure_selection=ensure)
+        elif event == "QUIT":
+            self.on_close()
 
     def _on_webview_ready_mainthread(self) -> None:
         if self.webview_ready:
@@ -749,6 +764,9 @@ class QuizApp:
         return "break"
 
     def on_close(self) -> None:
+        if self.closing:
+            return
+        self.closing = True
         try:
             self.executor.shutdown(wait=False, cancel_futures=True)
         except TypeError:
@@ -758,29 +776,58 @@ class QuizApp:
                 webview.destroy_window(self.window)
             except Exception:  # pylint: disable=broad-except
                 pass
-        self.root.destroy()
+            self.window = None
+        try:
+            self.root.quit()
+        except tk.TclError:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def run(self) -> None:
-        presentation_path = os.path.join(self.base_dir, "web", "index.html")
+        index_uri = (Path(self.base_dir) / "web" / "index.html").resolve().as_uri()
+        backend = select_webview_gui()
+        backend_label = backend or "default"
+        logging.info("Using pywebview GUI backend: %s", backend_label)
+        if self.debug_enabled:
+            self._debug("webview start backend=%s url=%s", backend_label, index_uri)
         self.window = webview.create_window(
             "Quiz Presentation",
-            presentation_path,
+            url=index_uri,
             js_api=self.bridge,
             width=1600,
             height=900,
             resizable=True,
+            confirm_close=True,
         )
-        backend = select_webview_gui()
-        start_kwargs = {"func": self.on_webview_ready, "http_server": True}
-        if backend:
-            logging.info("Starting pywebview with GUI backend: %s", backend)
-            start_kwargs["gui"] = backend
-        else:
-            logging.info("Starting pywebview with default GUI backend.")
-        webview.start(**start_kwargs)
+        if hasattr(self.window, "events") and hasattr(self.window.events, "closed"):
+            self.window.events.closed += self._on_webview_closed
 
-    def on_webview_ready(self) -> None:
+        def launch_webview() -> None:
+            start_kwargs = {"debug": self.debug_enabled}
+            if backend:
+                start_kwargs["gui"] = backend
+            try:
+                webview.start(self._on_webview_ready_webview, **start_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                logging.error("pywebview failed to start: %s", exc)
+                self.post_ui_event("ERROR", {"code": "webview_start", "message": str(exc)})
+
+        self.webview_thread = threading.Thread(target=launch_webview, name="WebviewThread", daemon=True)
+        self.webview_thread.start()
+        self._drain_ui_queue()
+        try:
+            self.root.mainloop()
+        finally:
+            self.closing = True
+
+    def _on_webview_ready_webview(self) -> None:
         self.post_ui_event("WEBVIEW_READY")
+
+    def _on_webview_closed(self) -> None:
+        self.post_ui_event("QUIT")
 
 
 def main() -> None:
