@@ -306,19 +306,19 @@ class PresentationBridge:
         self.app = app
 
     def notify_ready(self) -> bool:
-        self.app.post_ui_event("presentation_ready")
+        self.app.post_ui_event("PRESENTATION_READY")
         return True
 
     def request_tts_chunks(self, payload: Dict[str, List[Dict[str, int]]]) -> bool:
-        self.app.post_ui_event("tts_request", payload)
+        self.app.post_ui_event("TTS_REQUEST", payload)
         return True
 
     def status(self, payload: Dict[str, int]) -> bool:
-        self.app.post_ui_event("status", payload)
+        self.app.post_ui_event("STATUS", payload)
         return True
 
     def error(self, payload: Dict[str, str]) -> bool:
-        self.app.post_ui_event("error", payload)
+        self.app.post_ui_event("ERROR", payload)
         return True
 
 
@@ -332,6 +332,7 @@ class QuizApp:
             raise RuntimeError("No quiz questions found.")
         self.root = tk.Tk()
         self.root.title("Quiz Control")
+        self.main_thread = threading.current_thread()
         self.bridge = PresentationBridge(self)
         self.window: Optional[webview.Window] = None
         self.webview_ready = False
@@ -368,8 +369,6 @@ class QuizApp:
         self.root.after(50, self._drain_ui_queue)
         if self.questions:
             self.set_current_question(0)
-            if self.questions_listbox:
-                self.questions_listbox.selection_set(0)
 
     def _debug(self, message: str, *args: object) -> None:
         if not self.debug_enabled:
@@ -444,6 +443,9 @@ class QuizApp:
         answer_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         ttk.Label(answer_frame, textvariable=self.answer_text, wraplength=280, justify=tk.LEFT).pack(anchor=tk.W, padx=4, pady=4)
 
+    def _on_ui_thread(self) -> bool:
+        return threading.current_thread() is self.main_thread
+
     def post_ui_event(self, event: str, payload: Optional[Dict] = None) -> None:
         self._debug("queue %s", event)
         self.ui_queue.put((event, payload))
@@ -455,16 +457,39 @@ class QuizApp:
         if not selection:
             return
         index = selection[0]
-        self.set_current_question(index)
+        self.set_current_question(index, ensure_selection=False)
 
-    def set_current_question(self, index: int) -> None:
+    def set_current_question(self, index: int, *, ensure_selection: bool = True) -> None:
+        if index < 0 or index >= len(self.questions):
+            return
+        if not self._on_ui_thread():
+            self.post_ui_event("SELECT_QUESTION", {"index": index, "ensure_selection": ensure_selection})
+            return
+        self._apply_question_selection(index, ensure_selection=ensure_selection)
+
+    def _apply_question_selection(self, index: int, *, ensure_selection: bool = True) -> None:
         if index < 0 or index >= len(self.questions):
             return
         self.current_question = self.questions[index]
         answers = " / ".join(self.current_question.answers)
         self.answer_text.set(answers)
-        if self.presentation_ready:
-            self.send_command("load_question", self.build_question_payload(self.current_question))
+        if ensure_selection and self.questions_listbox:
+            self.questions_listbox.selection_clear(0, tk.END)
+            self.questions_listbox.selection_set(index)
+            self.questions_listbox.see(index)
+        self._sync_current_question()
+
+    def _sync_current_question(self) -> None:
+        if not (self.presentation_ready and self.webview_ready):
+            return
+        if not self.current_question:
+            return
+        payload = self.build_question_payload(self.current_question)
+        self.send_command("load_question", payload)
+        self.send_command("set_cps", {"value": self.cps_var.get()})
+        self.send_command("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
+        self.send_command("set_zoom", {"value": round(self.zoom_var.get(), 2)})
+        self.send_command("set_compact", {"value": bool(self.compact_var.get())})
 
     def build_question_payload(self, question: QuizQuestion) -> Dict:
         return {
@@ -491,12 +516,16 @@ class QuizApp:
             messagebox.showinfo("情報", "問題が見つかりませんでした。")
             return
         self.questions = new_questions
-        if self.questions_listbox:
-            self.questions_listbox.delete(0, tk.END)
-            for idx, question in enumerate(self.questions):
-                title = question.title or f"Question {idx + 1}"
-                self.questions_listbox.insert(tk.END, f"{idx + 1}: {title}")
+        self._repopulate_question_listbox()
         self.set_current_question(0)
+
+    def _repopulate_question_listbox(self) -> None:
+        if not self.questions_listbox:
+            return
+        self.questions_listbox.delete(0, tk.END)
+        for idx, question in enumerate(self.questions):
+            title = question.title or f"Question {idx + 1}"
+            self.questions_listbox.insert(tk.END, f"{idx + 1}: {title}")
 
     def start_presentation(self) -> None:
         if not self.presentation_ready:
@@ -565,40 +594,53 @@ class QuizApp:
         else:
             self.voicevox_var.set("未起動")
             self.voicevox_alerted = True
-        if self.questions:
+        if self.questions and self.current_question is None:
             self.set_current_question(0)
+        self._sync_current_question()
 
     def _drain_ui_queue(self) -> None:
         try:
             while True:
                 event, payload = self.ui_queue.get_nowait()
                 self._debug("dispatch %s", event)
-                if event == "webview_ready":
-                    self._handle_webview_ready()
-                elif event == "presentation_ready":
-                    self.on_presentation_ready()
-                elif event == "tts_request":
-                    if isinstance(payload, dict):
-                        self.handle_tts_request(payload)
-                elif event == "status":
-                    if isinstance(payload, dict):
-                        self.update_status(payload)
-                elif event == "error":
-                    logging.error("Presentation error: %s", payload)
-                elif event == "play_chunk":
-                    if isinstance(payload, dict):
-                        self.send_command("play_chunk", payload)
-                elif event == "voicevox_unavailable":
-                    self._handle_voicevox_unavailable()
+                self._handle_ui_event(event, payload)
         except queue.Empty:
             pass
         self.root.after(50, self._drain_ui_queue)
 
-    def _handle_webview_ready(self) -> None:
+    def _handle_ui_event(self, event: str, payload: Optional[Dict]) -> None:
+        if event == "WEBVIEW_READY":
+            self._on_webview_ready_mainthread()
+        elif event == "PRESENTATION_READY":
+            self.on_presentation_ready()
+        elif event == "TTS_REQUEST":
+            if isinstance(payload, dict):
+                self.handle_tts_request(payload)
+        elif event == "STATUS":
+            if isinstance(payload, dict):
+                self.update_status(payload)
+        elif event == "ERROR":
+            logging.error("Presentation error: %s", payload)
+        elif event == "PLAY_CHUNK":
+            if isinstance(payload, dict):
+                self.send_command("play_chunk", payload)
+        elif event == "VOICEVOX_UNAVAILABLE":
+            self._handle_voicevox_unavailable()
+        elif event == "SELECT_QUESTION":
+            if isinstance(payload, dict) and "index" in payload:
+                ensure = bool(payload.get("ensure_selection", True))
+                try:
+                    index = int(payload.get("index"))
+                except (TypeError, ValueError):
+                    return
+                self._apply_question_selection(index, ensure_selection=ensure)
+
+    def _on_webview_ready_mainthread(self) -> None:
         if self.webview_ready:
             return
         self.webview_ready = True
         self._debug("webview ready acknowledged")
+        self._sync_current_question()
 
     def _handle_voicevox_unavailable(self) -> None:
         if self.voicevox_alerted:
@@ -645,9 +687,9 @@ class QuizApp:
     def generate_chunk(self, chunk_id: str, text: str, is_kana: bool) -> None:
         audio = self.tts_manager.synthesize(text, is_kana=is_kana)
         if audio:
-            self.post_ui_event("play_chunk", {"id": chunk_id, "wavBase64": audio})
+            self.post_ui_event("PLAY_CHUNK", {"id": chunk_id, "wavBase64": audio})
         elif not self.tts_manager.check_service():
-            self.post_ui_event("voicevox_unavailable")
+            self.post_ui_event("VOICEVOX_UNAVAILABLE")
         else:
             self._debug("No audio generated for chunk %s", chunk_id)
 
@@ -738,7 +780,7 @@ class QuizApp:
         webview.start(**start_kwargs)
 
     def on_webview_ready(self) -> None:
-        self.post_ui_event("webview_ready")
+        self.post_ui_event("WEBVIEW_READY")
 
 
 def main() -> None:
