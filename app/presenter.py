@@ -80,7 +80,14 @@ class WebSocketBridgeServer(BridgeServerBase):
             asyncio.set_event_loop(loop)
 
             async def handler(websocket):  # type: ignore
-                path = getattr(websocket, "path", "/")
+                raw_path = getattr(websocket, "path", "/")
+                path = raw_path
+                if path == "/":
+                    logging.warning(
+                        "WebSocket client connected without explicit path; treating as /presentation (compat)",
+                    )
+                    # TODO: Remove this fallback after legacy clients are updated.
+                    path = "/presentation"
                 logging.info("WebSocket client connected: path=%s", path)
                 try:
                     if path == "/control":
@@ -88,7 +95,7 @@ class WebSocketBridgeServer(BridgeServerBase):
                     elif path == "/presentation":
                         await self._handle_presentation(websocket)
                     else:
-                        logging.warning("Unsupported WebSocket path: %s", path)
+                        logging.warning("Unsupported WebSocket path: %s", raw_path)
                         await websocket.close(code=1008, reason="unsupported path")
                 except Exception:  # pylint: disable=broad-except
                     logging.exception("Unhandled error in WebSocket handler (path=%s)", path)

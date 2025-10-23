@@ -85,6 +85,7 @@ function createWebSocketBridge(url) {
       socket.onopen = () => {
         const pending = queue.splice(0);
         pending.forEach((msg) => socket.send(msg));
+        console.info(`bridge socket open url=${url}`);
         notifyOpen();
       };
       socket.onmessage = (event) => {
@@ -101,7 +102,7 @@ function createWebSocketBridge(url) {
       };
       socket.onclose = (event) => {
         const reason = event.reason || '(no reason)';
-        console.warn(`bridge socket closed code=${event.code} reason=${reason}`);
+        console.warn(`bridge socket closed url=${url} code=${event.code} reason=${reason}`);
         ready = false;
         readyNotified = false;
         if (!manualClose) {
