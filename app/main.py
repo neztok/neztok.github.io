@@ -351,8 +351,16 @@ class WebSocketBridgeClient(BridgeClientBase):
                                 if task.exception():
                                     raise task.exception()
                     except Exception as exc:  # pylint: disable=broad-except
+                        close_info = ""
+                        try:
+                            import websockets  # type: ignore
+
+                            if isinstance(exc, websockets.exceptions.ConnectionClosed):  # type: ignore[attr-defined]
+                                close_info = f" (code={exc.code} reason={exc.reason})"
+                        except Exception:  # pylint: disable=broad-except
+                            pass
                         if self.connected:
-                            logging.info("WebSocket bridge disconnected: %s", exc)
+                            logging.info("WebSocket bridge disconnected: %s%s", exc, close_info)
                             self.connected = False
                             self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_WS}})
                         if self.stop_event.is_set():

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import os
@@ -79,15 +80,28 @@ class WebSocketBridgeServer(BridgeServerBase):
             asyncio.set_event_loop(loop)
 
             async def handler(websocket, path):  # type: ignore
-                peer = "control" if path == "/control" else "presentation"
-                logging.info("WebSocket client connected: %s", peer)
+                logging.info("WebSocket client connected: path=%s", path)
                 try:
                     if path == "/control":
                         await self._handle_control(websocket)
-                    else:
+                    elif path == "/presentation":
                         await self._handle_presentation(websocket)
+                    else:
+                        logging.warning("Unsupported WebSocket path: %s", path)
+                        await websocket.close(code=1008, reason="unsupported path")
+                except Exception:  # pylint: disable=broad-except
+                    logging.exception("Unhandled error in WebSocket handler (path=%s)", path)
+                    with contextlib.suppress(Exception):
+                        await websocket.close(code=1011, reason="internal error")
                 finally:
-                    logging.info("WebSocket client disconnected: %s", peer)
+                    code = getattr(websocket, "close_code", None)
+                    reason = getattr(websocket, "close_reason", "")
+                    logging.info(
+                        "WebSocket client disconnected: path=%s code=%s reason=%s",
+                        path,
+                        code,
+                        reason,
+                    )
 
             async def ws_main() -> None:
                 try:
@@ -142,8 +156,15 @@ class WebSocketBridgeServer(BridgeServerBase):
         try:
             async for message in websocket:
                 await self._forward_to_presentation(message)
-        except websockets.exceptions.ConnectionClosed:  # type: ignore[attr-defined]
-            pass
+        except websockets.exceptions.ConnectionClosed as err:  # type: ignore[attr-defined]
+            logging.info(
+                "Control connection closed: code=%s reason=%s",
+                err.code,
+                err.reason,
+            )
+        except Exception:
+            logging.exception("Control connection error")
+            raise
         finally:
             self.control_conn = None
 
@@ -155,8 +176,15 @@ class WebSocketBridgeServer(BridgeServerBase):
         try:
             async for message in websocket:
                 await self._forward_to_control(message)
-        except websockets.exceptions.ConnectionClosed:  # type: ignore[attr-defined]
-            pass
+        except websockets.exceptions.ConnectionClosed as err:  # type: ignore[attr-defined]
+            logging.info(
+                "Presentation connection closed: code=%s reason=%s",
+                err.code,
+                err.reason,
+            )
+        except Exception:
+            logging.exception("Presentation connection error")
+            raise
         finally:
             self.presentation_conn = None
 
@@ -405,21 +433,51 @@ class PresenterApp:
             sys.exit(1)
         base_dir = Path(__file__).resolve().parent.parent
         index_path = base_dir / "web" / "index.html"
-        index_uri = index_path.resolve().as_uri() + f"?mode={self.bridge_mode}&port={self.port}"
+        resolved_index = index_path.resolve()
+        index_exists = resolved_index.exists()
         backend = select_webview_gui()
         if self.debug:
             logging.debug("Bridge mode: %s", self.bridge_mode)
             logging.debug("Webview backend: %s", backend or "default")
-            logging.debug("index.html URI: %s", index_uri)
+            logging.debug("index.html resolved path: %s", resolved_index)
 
-        self.window = webview.create_window(
-            "Quiz Presentation",
-            url=index_uri,
-            width=1600,
-            height=900,
-            resizable=True,
-            confirm_close=True,
-        )
+        window_kwargs = {
+            "width": 1600,
+            "height": 900,
+            "resizable": True,
+            "confirm_close": True,
+        }
+
+        if not index_exists:
+            logging.error("Presentation HTML not found at %s", resolved_index)
+            escaped_path = html.escape(str(resolved_index))
+            error_html = (
+                "<!doctype html>\n"
+                "<html lang=\"ja\">\n"
+                "  <head><meta charset=\"utf-8\"><title>Presentation Error</title></head>\n"
+                "  <body style=\"font-family: sans-serif; background:#111; color:#f5f5f5; padding:24px;\">\n"
+                "    <h1>web/index.html が見つかりません</h1>\n"
+                "    <p>プレゼンテーション画面の HTML を <code>web/index.html</code> から読み込めませんでした。</p>\n"
+                "    <p>探したパス:</p>\n"
+                f"    <pre style=\"background:#222; padding:12px; border-radius:8px;\">{escaped_path}</pre>\n"
+                "    <p>プロジェクトの <code>web</code> ディレクトリが正しい場所にあるか確認してください。</p>\n"
+                "  </body>\n"
+                "</html>"
+            )
+            self.window = webview.create_window(
+                "Quiz Presentation",
+                html=error_html,
+                **window_kwargs,
+            )
+        else:
+            index_uri = resolved_index.as_uri() + f"?mode={self.bridge_mode}&port={self.port}"
+            if self.debug:
+                logging.debug("index.html URI: %s", index_uri)
+            self.window = webview.create_window(
+                "Quiz Presentation",
+                url=index_uri,
+                **window_kwargs,
+            )
 
         def on_closed() -> None:
             logging.info("Presentation window closed.")

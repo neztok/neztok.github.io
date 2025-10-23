@@ -99,7 +99,9 @@ function createWebSocketBridge(url) {
           }
         }
       };
-      socket.onclose = () => {
+      socket.onclose = (event) => {
+        const reason = event.reason || '(no reason)';
+        console.warn(`bridge socket closed code=${event.code} reason=${reason}`);
         ready = false;
         readyNotified = false;
         if (!manualClose) {
