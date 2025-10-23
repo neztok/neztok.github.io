@@ -19,7 +19,16 @@ const state = {
   currentAudioId: null,
   autoScroll: false,
   statusHint: '',
+  connectionState: 'disconnected',
 };
+
+const ConnectionState = {
+  DISCONNECTED: 'disconnected',
+  CONNECTED: 'connected',
+  READY: 'ready',
+};
+
+state.connectionState = ConnectionState.DISCONNECTED;
 
 const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 
@@ -29,13 +38,15 @@ let readyNotified = false;
 
 const params = new URLSearchParams(window.location.search || '');
 const bridgeMode = (params.get('mode') || 'ws').toLowerCase();
-const bridgePort = Number.parseInt(params.get('port') || '8765', 10);
+const parsedPort = Number.parseInt(params.get('port') || '', 10);
+const bridgePort = Number.isFinite(parsedPort) && parsedPort > 0 ? parsedPort : 8765;
 const bridgeWsUrl = `ws://127.0.0.1:${bridgePort}/presentation`;
 const bridgeHttpBase = `http://127.0.0.1:${bridgePort}`;
 
 function createWebSocketBridge(url) {
   const listeners = new Set();
   const openListeners = new Set();
+  const closeListeners = new Set();
   let socket = null;
   let ready = false;
   const queue = [];
@@ -63,6 +74,16 @@ function createWebSocketBridge(url) {
     });
   }
 
+  function notifyClose(details) {
+    closeListeners.forEach((cb) => {
+      try {
+        cb(details);
+      } catch (err) {
+        console.error('bridge close handler failed', err);
+      }
+    });
+  }
+
   function connect(delay = 0) {
     if (manualClose) {
       return;
@@ -81,11 +102,12 @@ function createWebSocketBridge(url) {
       if (manualClose) {
         return;
       }
+      console.log(`bridge connecting url=${url}`);
       socket = new WebSocket(url);
       socket.onopen = () => {
         const pending = queue.splice(0);
         pending.forEach((msg) => socket.send(msg));
-        console.info(`bridge socket open url=${url}`);
+        console.log(`bridge socket open url=${url}`);
         notifyOpen();
       };
       socket.onmessage = (event) => {
@@ -102,9 +124,10 @@ function createWebSocketBridge(url) {
       };
       socket.onclose = (event) => {
         const reason = event.reason || '(no reason)';
-        console.warn(`bridge socket closed url=${url} code=${event.code} reason=${reason}`);
+        console.log(`bridge socket close url=${url} code=${event.code} reason=${reason}`);
         ready = false;
         readyNotified = false;
+        notifyClose({ code: event.code, reason });
         if (!manualClose) {
           connect(500);
         }
@@ -136,6 +159,11 @@ function createWebSocketBridge(url) {
         }
       }
     },
+    onClose(callback) {
+      if (typeof callback === 'function') {
+        closeListeners.add(callback);
+      }
+    },
     close() {
       manualClose = true;
       if (reconnectTimer) {
@@ -152,6 +180,8 @@ function createWebSocketBridge(url) {
         }
         socket = null;
       }
+      notifyClose({ manual: true });
+      closeListeners.clear();
     },
   };
 }
@@ -159,6 +189,7 @@ function createWebSocketBridge(url) {
 function createHttpBridge(baseUrl) {
   const listeners = new Set();
   const openListeners = new Set();
+  const closeListeners = new Set();
   let source = null;
   let manualClose = false;
   let reconnectTimer = null;
@@ -183,6 +214,16 @@ function createHttpBridge(baseUrl) {
     });
   }
 
+  function notifyClose(details) {
+    closeListeners.forEach((cb) => {
+      try {
+        cb(details);
+      } catch (err) {
+        console.error('bridge close handler failed', err);
+      }
+    });
+  }
+
   function connect(delay = 0) {
     if (manualClose) {
       return;
@@ -201,20 +242,25 @@ function createHttpBridge(baseUrl) {
       if (manualClose) {
         return;
       }
-      source = new EventSource(`${baseUrl}/api/presentation/events`, { withCredentials: false });
+      const eventsUrl = `${baseUrl}/api/presentation/events`;
+      console.log(`bridge connecting url=${eventsUrl}`);
+      source = new EventSource(eventsUrl, { withCredentials: false });
       source.onopen = () => {
+        console.log(`bridge eventsource open url=${eventsUrl}`);
         notifyOpen();
       };
       source.onmessage = (event) => {
         notifyMessage(event.data);
       };
       source.onerror = () => {
+        console.log(`bridge eventsource close url=${eventsUrl}`);
         try {
           source.close();
         } catch (err) {
           // ignore
         }
         readyNotified = false;
+        notifyClose({ error: true });
         if (!manualClose) {
           connect(1000);
         }
@@ -246,6 +292,11 @@ function createHttpBridge(baseUrl) {
         openListeners.add(callback);
       }
     },
+    onClose(callback) {
+      if (typeof callback === 'function') {
+        closeListeners.add(callback);
+      }
+    },
     close() {
       manualClose = true;
       if (reconnectTimer) {
@@ -262,8 +313,36 @@ function createHttpBridge(baseUrl) {
         }
         source = null;
       }
+      notifyClose({ manual: true });
+      closeListeners.clear();
     },
   };
+}
+
+function connectionStateLabel(name) {
+  switch (name) {
+    case ConnectionState.CONNECTED:
+      return '接続済み';
+    case ConnectionState.READY:
+      return '準備OK';
+    default:
+      return '未接続';
+  }
+}
+
+function updateConnectionBadge() {
+  if (!elements.connectionBadge) return;
+  elements.connectionBadge.dataset.state = state.connectionState;
+  elements.connectionBadge.textContent = connectionStateLabel(state.connectionState);
+}
+
+function setConnectionState(nextState) {
+  if (state.connectionState === nextState) {
+    updateConnectionBadge();
+    return;
+  }
+  state.connectionState = nextState;
+  updateConnectionBadge();
 }
 
 let bridgeConnection = null;
@@ -281,8 +360,14 @@ function ensureBridge() {
       }
     });
     bridgeConnection.onOpen(() => {
+      setConnectionState(ConnectionState.CONNECTED);
       notifyReady();
     });
+    if (typeof bridgeConnection.onClose === 'function') {
+      bridgeConnection.onClose(() => {
+        setConnectionState(ConnectionState.DISCONNECTED);
+      });
+    }
   }
   return bridgeConnection;
 }
@@ -299,6 +384,7 @@ function closeBridgeConnection() {
   bridgeReceiver = null;
   pendingBridgeMessages = [];
   readyNotified = false;
+  setConnectionState(ConnectionState.DISCONNECTED);
 }
 
 function setBridgeReceiver(handler) {
@@ -796,6 +882,38 @@ const typewriter = {
   },
 };
 
+function resetPresentationView() {
+  typewriter.stop(true);
+  resetTtsPrefetch({ flushAudio: true });
+  state.question = null;
+  state.fullText = '';
+  state.pages = [];
+  state.pageIndex = 0;
+  state.typedLength = 0;
+  state.phraseIndex = 0;
+  state.statusHint = '';
+  if (elements.title) {
+    elements.title.textContent = '';
+  }
+  if (elements.content) {
+    elements.content.textContent = '';
+  }
+  if (elements.pageIndicator) {
+    elements.pageIndicator.textContent = '';
+  }
+  if (elements.contentShell) {
+    elements.contentShell.scrollTop = 0;
+  }
+  clearAnswerPanel();
+  setStatusHint('待機中');
+  scheduleStatus();
+}
+
+function handlePresentationInit() {
+  resetPresentationView();
+  setConnectionState(ConnectionState.READY);
+}
+
 function computeDelay(page, index) {
   const char = page.graphemes[index] || '';
   const next = page.graphemes[index + 1] || '';
@@ -938,7 +1056,14 @@ window.appBridge = {
   receive(message) {
     try {
       const payload = typeof message === 'string' ? JSON.parse(message) : message;
-      if (!payload || !payload.action) {
+      if (!payload) {
+        return;
+      }
+      if (payload.type === 'PRESENTATION_INIT') {
+        handlePresentationInit();
+        return;
+      }
+      if (!payload.action) {
         return;
       }
       const handler = handlers[payload.action];
@@ -963,6 +1088,7 @@ function notifyReady() {
 document.addEventListener('DOMContentLoaded', () => {
   elements = {
     app: document.getElementById('app'),
+    connectionBadge: document.getElementById('connectionBadge'),
     content: document.getElementById('content'),
     contentShell: document.getElementById('contentShell'),
     pageIndicator: document.getElementById('pageIndicator'),
@@ -972,6 +1098,7 @@ document.addEventListener('DOMContentLoaded', () => {
     answers: document.getElementById('answers'),
     explain: document.getElementById('explain'),
   };
+  updateConnectionBadge();
   applyZoom(state.zoom);
   setCompact(state.compact);
   updateSettingsHint();
