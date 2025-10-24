@@ -69,15 +69,20 @@ function sanitizeResourceAttribute(element, attributeName) {
   }
 
   let canonical;
+  let canonicalWithoutSearch;
   try {
     const resolved = new URL(rawValue, document.baseURI);
     resolved.hash = '';
     canonical = resolved.href;
+    const withoutSearch = new URL(resolved.href);
+    withoutSearch.search = '';
+    canonicalWithoutSearch = withoutSearch.href;
   } catch (err) {
     return;
   }
 
-  if (SELF_URL_BLOCKLIST.has(canonical)) {
+  if (SELF_URL_BLOCKLIST.has(canonical) ||
+      (canonicalWithoutSearch && SELF_URL_BLOCKLIST.has(canonicalWithoutSearch))) {
     console.error('[resource-guard] Blocked self-referential resource URL', {
       tag: element.tagName,
       attribute: attributeName,
