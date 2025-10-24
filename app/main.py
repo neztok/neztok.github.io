@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -631,6 +632,8 @@ class QuizApp:
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.page_seq = 0
         self.active_page_seq = 0
+        self.pending_tts_jobs: Dict[int, int] = defaultdict(int)
+        self.pending_tts_lock = threading.Lock()
         self.user_ready = False
         self.cps_var = tk.IntVar(value=14)
         self.pause_factor_var = tk.DoubleVar(value=1.0)
@@ -669,9 +672,21 @@ class QuizApp:
         self.ui_queue.put((payload.get("action", ""), payload.get("data")))
 
     def _next_page_seq(self) -> int:
+        previous = self.page_seq
         self.page_seq += 1
         self.active_page_seq = self.page_seq
+        if previous:
+            self._cancel_pending_jobs_before(self.page_seq)
+        logging.info("emit page_seq=<%d>", self.page_seq)
         return self.page_seq
+
+    def _cancel_pending_jobs_before(self, new_seq: int) -> None:
+        with self.pending_tts_lock:
+            for seq in list(self.pending_tts_jobs.keys()):
+                if seq < new_seq:
+                    count = self.pending_tts_jobs.pop(seq, 0)
+                    if count:
+                        logging.info("cancel all for page_seq=<%d> count=%d", seq, count)
 
     def send_with_seq(self, action: str, data: Optional[Dict] = None, *, increment: bool = False) -> None:
         payload = dict(data or {})
@@ -837,34 +852,75 @@ class QuizApp:
             seq = int(payload.get("seq", self.page_seq))
         except (TypeError, ValueError):
             seq = self.page_seq
+        sent_seq: Optional[int] = None
+        try:
+            sent_seq = int(payload.get("sentSeq"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            pass
+        if sent_seq is None:
+            for item in slices:
+                try:
+                    sent_seq = int(item.get("sentSeq"))  # type: ignore[arg-type]
+                    break
+                except (TypeError, ValueError):
+                    continue
         if seq < self.active_page_seq:
+            logging.info(
+                "drop stale job page_seq=%d sent_seq=%s (expected >=%d)",
+                seq,
+                sent_seq,
+                self.active_page_seq,
+            )
             return
         question = self.current_question
 
+        with self.pending_tts_lock:
+            self.pending_tts_jobs[seq] += 1
+
         def worker() -> None:
+            started = time.perf_counter()
             chunks: List[str] = []
-            for item in slices:
-                start = int(item.get("startChar", 0))
-                end = int(item.get("endChar", 0))
-                segments = question.get_tts_segments(start, end)
-                texts = []
-                for text, is_kana in segments:
-                    if len(text) > MAX_CHARS_PER_TTS:
-                        for idx in range(0, len(text), MAX_CHARS_PER_TTS):
-                            texts.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
+            logging.info("tts gen start page_seq=%d sent_seq=%s", seq, sent_seq)
+            try:
+                for item in slices:
+                    start = int(item.get("startChar", 0))
+                    end = int(item.get("endChar", 0))
+                    segments = question.get_tts_segments(start, end)
+                    texts = []
+                    for text, is_kana in segments:
+                        if len(text) > MAX_CHARS_PER_TTS:
+                            for idx in range(0, len(text), MAX_CHARS_PER_TTS):
+                                texts.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
+                        else:
+                            texts.append((text, is_kana))
+                    for text, is_kana in texts:
+                        wav = self.tts_manager.synthesize(text, is_kana=is_kana)
+                        if wav:
+                            chunks.append(wav)
+                elapsed_ms = int((time.perf_counter() - started) * 1000)
+                logging.info("tts gen end page_seq=%d sent_seq=%s ms=%d", seq, sent_seq, elapsed_ms)
+                if seq < self.active_page_seq:
+                    logging.info(
+                        "drop stale job page_seq=%d sent_seq=%s (expected >=%d)",
+                        seq,
+                        sent_seq,
+                        self.active_page_seq,
+                    )
+                    return
+                response = {"requestId": request_id, "seq": seq, "chunks": chunks}
+                if sent_seq is not None:
+                    response["sentSeq"] = sent_seq
+                self.presenter.send("tts_result", response)
+                if not chunks and not self.voicevox_alerted:
+                    self.voicevox_alerted = True
+                    self.ui_queue.put(("VOICEVOX_UNAVAILABLE", None))
+            finally:
+                with self.pending_tts_lock:
+                    current = self.pending_tts_jobs.get(seq, 0)
+                    if current <= 1:
+                        self.pending_tts_jobs.pop(seq, None)
                     else:
-                        texts.append((text, is_kana))
-                for text, is_kana in texts:
-                    wav = self.tts_manager.synthesize(text, is_kana=is_kana)
-                    if wav:
-                        chunks.append(wav)
-            if seq < self.active_page_seq:
-                return
-            response = {"requestId": request_id, "seq": seq, "chunks": chunks}
-            self.presenter.send("tts_result", response)
-            if not chunks and not self.voicevox_alerted:
-                self.voicevox_alerted = True
-                self.ui_queue.put(("VOICEVOX_UNAVAILABLE", None))
+                        self.pending_tts_jobs[seq] = current - 1
 
         self.executor.submit(worker)
 
