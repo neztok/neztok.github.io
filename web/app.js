@@ -1330,9 +1330,13 @@ const handlers = {
     if (!ensureSequence(data)) {
       return;
     }
+    const expectedSeq = state.activeSeq;
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     await setPage(fromPage, { flushAudio: true });
     await waitForUserReady();
+    if (expectedSeq !== state.activeSeq) {
+      return;
+    }
     const page = currentPage();
     if (!page) {
       return;
@@ -1358,7 +1362,11 @@ const handlers = {
     if (!ensureSequence(data)) {
       return;
     }
+    const expectedSeq = state.activeSeq;
     await waitForUserReady();
+    if (expectedSeq !== state.activeSeq) {
+      return;
+    }
     const page = currentPage();
     if (!page) {
       return;
