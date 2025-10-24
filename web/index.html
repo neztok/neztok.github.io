@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Quiz Presentation</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div id="app" class="compact" data-zoom="1.1">
+      <div id="connectionBadge" class="connection-badge" data-stage="disconnected">未接続</div>
+      <header id="titleBar">
+        <div class="title-text" id="questionTitle"></div>
+        <div class="status-text" id="statusHint"></div>
+      </header>
+      <main id="presentation">
+        <div id="contentShell">
+          <div id="content"></div>
+          <div id="pageIndicator"></div>
+        </div>
+        <div id="overlayFlash"></div>
+      </main>
+      <aside id="answerPanel" hidden>
+        <h2>正解</h2>
+        <p id="answers"></p>
+        <div id="explain"></div>
+      </aside>
+    </div>
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,8 @@
+# Core UI and VOICEVOX integration
+pywebview>=6,<7
+requests>=2.31,<3
+typing_extensions>=4.7,<5
+
+# Bridge servers
+aiohttp>=3.9,<3.10
+websockets>=10,<12
