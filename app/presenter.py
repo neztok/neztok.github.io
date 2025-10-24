@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import unquote
 from typing import Awaitable, Callable, Dict, List, Optional
 
 import webview
@@ -490,7 +491,7 @@ class PresenterApp:
 
         file_uri = index_uri.split("?", 1)[0]
         if file_uri.startswith("file:///"):
-            path_fragment = file_uri[8:]
+            path_fragment = unquote(file_uri[8:])
             if os.name != "nt" and not path_fragment.startswith("/"):
                 path_fragment = "/" + path_fragment
             index_file_path = Path(path_fragment)
