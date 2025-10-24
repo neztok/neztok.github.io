@@ -8,8 +8,8 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote
-from typing import Awaitable, Callable, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 import webview
 
@@ -450,6 +450,8 @@ class PresenterApp:
         else:
             self.server = HttpBridgeServer("127.0.0.1", port, debug=debug)
         self.window: Optional[webview.Window] = None
+        self._pending_query_params: List[Tuple[str, str]] = []
+        self._query_applied = False
 
     def run(self) -> None:
         try:
@@ -458,14 +460,13 @@ class PresenterApp:
             logging.error("Failed to start bridge server: %s", exc)
             sys.exit(1)
         base_dir = Path(__file__).resolve().parent.parent
-        index_path = base_dir / "web" / "index.html"
-        resolved_index = index_path.resolve()
-        index_exists = resolved_index.exists()
+        index_path = (base_dir / "web" / "index.html").resolve()
+        index_exists = index_path.exists()
         backend = select_webview_gui()
         if self.debug:
             logging.debug("Bridge mode: %s", self.bridge_mode)
             logging.debug("Webview backend: %s", backend or "default")
-            logging.debug("index.html resolved path: %s", resolved_index)
+            logging.debug("index.html resolved path: %s", index_path)
 
         window_kwargs = {
             "width": 1600,
@@ -477,35 +478,21 @@ class PresenterApp:
 
         if not index_exists:
             self.server.stop()
-            raise FileNotFoundError(f"Presentation HTML not found at {resolved_index}")
+            raise FileNotFoundError(f"Presentation HTML not found at {index_path}")
 
         version_token = os.environ.get("PRESENTATION_INDEX_VERSION") or str(int(time.time()))
-        query_params = [
-            f"mode={self.bridge_mode}",
-            f"port={self.port}",
-            f"v={version_token}",
+        self._pending_query_params = [
+            ("mode", self.bridge_mode),
+            ("port", str(self.port)),
+            ("v", version_token),
         ]
-        index_uri = resolved_index.as_uri() + "?" + "&".join(query_params)
         if self.debug:
-            logging.debug("index.html URI: %s", index_uri)
+            logging.debug("Presentation query params: %s", self._pending_query_params)
 
-        file_uri = index_uri.split("?", 1)[0]
-        if file_uri.startswith("file:///"):
-            path_fragment = unquote(file_uri[8:])
-            if os.name != "nt" and not path_fragment.startswith("/"):
-                path_fragment = "/" + path_fragment
-            index_file_path = Path(path_fragment)
-        else:
-            index_file_path = resolved_index
-
-        if not index_file_path.exists():
-            self.server.stop()
-            raise FileNotFoundError(f"Presentation HTML not found at {index_file_path}")
-
-        logging.info("Loading presentation HTML: %s", index_uri)
+        logging.info("Loading presentation HTML: %s", index_path)
         self.window = webview.create_window(
             "Quiz Presentation",
-            url=index_uri,
+            url=str(index_path),
             **window_kwargs,
         )
 
@@ -517,12 +504,42 @@ class PresenterApp:
         self.window.events.closed += on_closed
 
         def on_loaded() -> None:
+            current_url = self.window.get_current_url() if self.window else ""
+            if current_url and "mode=" not in current_url:
+                if self.debug:
+                    logging.debug("Presentation loaded without query params yet: %s", current_url)
+                return
             logging.info("Presentation HTML load requested (check DevTools if blank)")
             self.server.send_to_control({"action": "READY", "data": {}})
 
         self.window.events.loaded += on_loaded
 
-        webview.start(gui=backend, debug=self.debug)
+        start_kwargs = {"func": self.on_webview_ready, "http_server": True, "debug": self.debug}
+        if backend:
+            start_kwargs["gui"] = backend
+        webview.start(**start_kwargs)
+
+    def on_webview_ready(self) -> None:
+        if not self.window or self._query_applied:
+            return
+        current_url = self.window.get_current_url()
+        if not current_url:
+            return
+        parsed = urlsplit(current_url)
+        existing_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        needs_reload = False
+        for key, value in self._pending_query_params:
+            if existing_params.get(key) != value:
+                existing_params[key] = value
+                needs_reload = True
+        self._query_applied = True
+        if not needs_reload:
+            return
+        new_query = urlencode(existing_params)
+        target_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
+        if self.debug:
+            logging.debug("Reloading presentation URL with query params: %s", target_url)
+        self.window.load_url(target_url)
 
     def stop(self) -> None:
         self.server.stop()
