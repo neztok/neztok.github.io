@@ -756,6 +756,11 @@ class QuizApp:
             self.presentation_ready = False
             self.voicevox_var.set("未確認")
             self.voicevox_alerted = False
+        elif event == "PRESENTATION_DISCONNECTED":
+            self.bridge_var.set("未接続")
+            self.presentation_ready = False
+            self.voicevox_var.set("未確認")
+            self.voicevox_alerted = False
         elif event == "PRESENTER_EXITED":
             self.bridge_var.set("停止")
             self.presentation_ready = False

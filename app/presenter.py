@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import webview
 
@@ -194,6 +194,8 @@ class WebSocketBridgeServer(BridgeServerBase):
             raise
         finally:
             self.presentation_conn = None
+            if not self.stop_event.is_set():
+                self.send_to_control({"action": "PRESENTATION_DISCONNECTED", "data": {}})
 
     async def _flush_pending(self, pending: List[str], websocket) -> None:
         while pending:
@@ -311,8 +313,16 @@ class HttpBridgeServer(BridgeServerBase):
         async def sse_control(request: web.Request) -> web.StreamResponse:
             return await self._sse_endpoint(request, self.control_clients, self.pending_to_control)
 
+        async def notify_presentation_disconnect() -> None:
+            await self._broadcast_to_control(json.dumps({"action": "PRESENTATION_DISCONNECTED", "data": {}}))
+
         async def sse_presentation(request: web.Request) -> web.StreamResponse:
-            return await self._sse_endpoint(request, self.presentation_clients, self.pending_to_presentation)
+            return await self._sse_endpoint(
+                request,
+                self.presentation_clients,
+                self.pending_to_presentation,
+                on_disconnect=notify_presentation_disconnect,
+            )
 
         self.app.router.add_post("/api/cmd", post_cmd)
         self.app.router.add_post("/api/presentation", post_presentation)
@@ -333,7 +343,14 @@ class HttpBridgeServer(BridgeServerBase):
         for queue in queues:
             await queue.put(message)
 
-    async def _sse_endpoint(self, request, queues: List[asyncio.Queue], pending: List[str]):
+    async def _sse_endpoint(
+        self,
+        request,
+        queues: List[asyncio.Queue],
+        pending: List[str],
+        *,
+        on_disconnect: Optional[Callable[[], Awaitable[None]]] = None,
+    ):
         from aiohttp import web
 
         headers = {
@@ -365,6 +382,8 @@ class HttpBridgeServer(BridgeServerBase):
                 await response.write_eof()
             except ConnectionResetError:
                 pass
+            if on_disconnect and not self.stop_event.is_set() and not queues:
+                await on_disconnect()
         return response
 
     def start(self) -> None:
