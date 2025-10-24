@@ -629,6 +629,9 @@ class QuizApp:
         self.tts_manager = TTSManager()
         self.voicevox_alerted = False
         self.executor = ThreadPoolExecutor(max_workers=2)
+        self.page_seq = 0
+        self.active_page_seq = 0
+        self.user_ready = False
         self.cps_var = tk.IntVar(value=14)
         self.pause_factor_var = tk.DoubleVar(value=1.0)
         self.zoom_var = tk.DoubleVar(value=1.10)
@@ -664,6 +667,19 @@ class QuizApp:
 
     def _handle_bridge_event(self, payload: Dict) -> None:
         self.ui_queue.put((payload.get("action", ""), payload.get("data")))
+
+    def _next_page_seq(self) -> int:
+        self.page_seq += 1
+        self.active_page_seq = self.page_seq
+        return self.page_seq
+
+    def send_with_seq(self, action: str, data: Optional[Dict] = None, *, increment: bool = False) -> None:
+        payload = dict(data or {})
+        if increment or self.page_seq == 0:
+            payload["seq"] = self._next_page_seq()
+        else:
+            payload["seq"] = self.page_seq
+        self.presenter.send(action, payload)
 
     def create_control_ui(self) -> None:
         main_frame = ttk.Frame(self.root, padding=12)
@@ -763,11 +779,13 @@ class QuizApp:
             self.presentation_ready = False
             self.voicevox_var.set("未確認")
             self.voicevox_alerted = False
+            self.user_ready = False
         elif event == "PRESENTATION_DISCONNECTED":
             self.bridge_var.set("未接続")
             self.presentation_ready = False
             self.voicevox_var.set("未確認")
             self.voicevox_alerted = False
+            self.user_ready = False
         elif event == "PRESENTER_EXITED":
             self.bridge_var.set("停止")
             self.presentation_ready = False
@@ -778,6 +796,9 @@ class QuizApp:
         elif event == "VOICEVOX_UNAVAILABLE":
             if self.voicevox_alerted:
                 messagebox.showwarning("VOICEVOX", "VOICEVOX が起動していない可能性があります。")
+        elif event == "USER_READY":
+            self.user_ready = True
+            self.bridge_var.set("準備完了")
 
     def on_presentation_ready(self) -> None:
         if self.presentation_ready:
@@ -785,7 +806,7 @@ class QuizApp:
         self.presentation_ready = True
         self.bridge_var.set("接続中")
         self._debug("sending presentation init handshake")
-        self.presenter.send("presentation_init", {"type": "PRESENTATION_INIT"})
+        self.send_with_seq("presentation_init", {"type": "PRESENTATION_INIT"})
         available = self.tts_manager.check_service()
         if available:
             self.voicevox_var.set("起動中")
@@ -808,13 +829,20 @@ class QuizApp:
         self.queue_var.set(str(queue_len))
 
     def handle_tts_request(self, payload: Dict) -> None:
+        request_id = payload.get("requestId")
         slices = payload.get("slice")
-        if not isinstance(slices, list) or not self.current_question:
+        if not request_id or not isinstance(slices, list) or not self.current_question:
+            return
+        try:
+            seq = int(payload.get("seq", self.page_seq))
+        except (TypeError, ValueError):
+            seq = self.page_seq
+        if seq < self.active_page_seq:
             return
         question = self.current_question
 
         def worker() -> None:
-            chunks = []
+            chunks: List[str] = []
             for item in slices:
                 start = int(item.get("startChar", 0))
                 end = int(item.get("endChar", 0))
@@ -829,12 +857,12 @@ class QuizApp:
                 for text, is_kana in texts:
                     wav = self.tts_manager.synthesize(text, is_kana=is_kana)
                     if wav:
-                        chunk_id = f"chunk-{len(chunks)}"
-                        chunks.append({"id": chunk_id, "wavBase64": wav})
-            if chunks:
-                for chunk in chunks:
-                    self.presenter.send("play_chunk", chunk)
-            elif not self.voicevox_alerted:
+                        chunks.append(wav)
+            if seq < self.active_page_seq:
+                return
+            response = {"requestId": request_id, "seq": seq, "chunks": chunks}
+            self.presenter.send("tts_result", response)
+            if not chunks and not self.voicevox_alerted:
                 self.voicevox_alerted = True
                 self.ui_queue.put(("VOICEVOX_UNAVAILABLE", None))
 
@@ -851,11 +879,11 @@ class QuizApp:
     def sync_current_settings(self) -> None:
         if not self.presentation_ready or not self.current_question:
             return
-        self.presenter.send("load_question", self.create_question_payload(self.current_question))
-        self.presenter.send("set_cps", {"value": self.cps_var.get()})
-        self.presenter.send("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
-        self.presenter.send("set_zoom", {"value": round(self.zoom_var.get(), 2)})
-        self.presenter.send("set_compact", {"value": bool(self.compact_var.get())})
+        self.send_with_seq("load_question", self.create_question_payload(self.current_question), increment=True)
+        self.send_with_seq("set_cps", {"value": self.cps_var.get()})
+        self.send_with_seq("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
+        self.send_with_seq("set_zoom", {"value": round(self.zoom_var.get(), 2)})
+        self.send_with_seq("set_compact", {"value": bool(self.compact_var.get())})
 
     def set_current_question(self, index: int) -> None:
         if index < 0 or index >= len(self.questions):
@@ -880,44 +908,44 @@ class QuizApp:
         if not self.presentation_ready or not self.current_question:
             messagebox.showwarning("未接続", "プレゼン画面が未接続です。")
             return
-        self.presenter.send("start", {})
+        self.send_with_seq("start", {})
 
     def stop_presentation(self, reason: str) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("stop_all", {"reason": reason})
+        self.send_with_seq("stop_all", {"reason": reason})
 
     def resume_presentation(self) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("resume", {})
+        self.send_with_seq("resume", {})
 
     def reveal_answer(self) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("reveal_answer", {})
+        self.send_with_seq("reveal_answer", {})
 
     def update_cps(self) -> None:
         value = max(10, min(18, self.cps_var.get()))
         self.cps_var.set(value)
         if self.presentation_ready:
-            self.presenter.send("set_cps", {"value": value})
+            self.send_with_seq("set_cps", {"value": value})
 
     def update_pause_factor(self) -> None:
         value = max(0.8, min(1.4, float(self.pause_factor_var.get())))
         self.pause_factor_var.set(value)
         if self.presentation_ready:
-            self.presenter.send("set_pause_factor", {"value": round(value, 2)})
+            self.send_with_seq("set_pause_factor", {"value": round(value, 2)})
 
     def update_zoom(self) -> None:
         value = max(0.85, min(1.4, float(self.zoom_var.get())))
         self.zoom_var.set(value)
         if self.presentation_ready:
-            self.presenter.send("set_zoom", {"value": round(value, 2)})
+            self.send_with_seq("set_zoom", {"value": round(value, 2)})
 
     def update_compact(self) -> None:
         if self.presentation_ready:
-            self.presenter.send("set_compact", {"value": bool(self.compact_var.get())})
+            self.send_with_seq("set_compact", {"value": bool(self.compact_var.get())})
 
     def load_quiz_file(self) -> None:
         file_path = filedialog.askopenfilename(filetypes=[("Quiz", "*.txt"), ("All", "*.*")])
@@ -956,13 +984,13 @@ class QuizApp:
         current = max(self.current_status.get("page", 1) - 1, 0)
         total = max(self.current_status.get("totalPages", 1), 1)
         next_page = min(current + 1, total - 1)
-        self.presenter.send("goto_page", {"page": next_page})
+        self.send_with_seq("goto_page", {"page": next_page}, increment=True)
 
     def handle_page_up(self, event) -> None:  # type: ignore[override]
         del event
         current = max(self.current_status.get("page", 1) - 1, 0)
         prev_page = max(current - 1, 0)
-        self.presenter.send("goto_page", {"page": prev_page})
+        self.send_with_seq("goto_page", {"page": prev_page}, increment=True)
 
     def handle_escape(self, event) -> None:  # type: ignore[override]
         del event
