@@ -1,12 +1,12 @@
 # クイズ読み上げアプリ
 
-Discord での画面共有を想定したクイズ出題用アプリです。Tkinter のコントロール画面と、pywebview で描画するプレゼンテーション画面を連携させ、タイプライタ表示と VOICEVOX による読み上げを同期再生します。スペースキーによる早押し停止や、ページ切り替え時の TTS 先読みなど、実況向けの運用に必要な最低限の機能を備えています。
+Discord での画面共有を想定したクイズ出題用アプリです。Tkinter のコントロール画面と、既定ブラウザで表示するプレゼンテーション画面を連携させ、タイプライタ表示と VOICEVOX による読み上げを同期再生します。スペースキーによる早押し停止や、ページ切り替え時の TTS 先読みなど、実況向けの運用に必要な最低限の機能を備えています。
 
 ## 構成
 
 ```
 app/main.py       # Tkinter コントロール UI・子プロセス制御・VOICEVOX 連携
-app/presenter.py  # プレゼンテーション用サブプロセス（pywebview + ブリッジサーバ）
+app/presenter.py  # プレゼンテーション用サブプロセス（HTTP/WS ブリッジ + 静的配信）
 web/index.html    # プレゼンテーション画面 HTML
 web/style.css     # プレゼンテーション画面のテーマ・レイアウト
 web/app.js        # タイプライタ制御・ページ分割・WebAudio 再生
@@ -16,8 +16,8 @@ requirements.txt  # 必要ライブラリ
 
 ### 2 プロセス構成
 
-本アプリは Tkinter のコントロール UI と pywebview のプレゼン画面を**別プロセス**で動作させます。親プロセス（`app/main.py`）は Tk メイン
-ループを保持し、子プロセス（`app/presenter.py`）が pywebview ウィンドウとブリッジサーバを起動します。両プロセス間の通信は JSON メッ
+本アプリは Tkinter のコントロール UI とブラウザで描画するプレゼン画面を**別プロセス**で動作させます。親プロセス（`app/main.py`）は Tk メイン
+ループを保持し、子プロセス（`app/presenter.py`）が `aiohttp` ベースのブリッジサーバと静的ファイル配信を起動し、既定ブラウザで `http://127.0.0.1:<ポート>/` を開きます。両プロセス間の通信は JSON メッ
 セージで行い、以下の 2 種類から選択できます。
 
 - `--bridge ws`（既定）: 子プロセスが WebSocket サーバ（`ws://127.0.0.1:<動的ポート>`）を立ち上げ、親プロセスとプレゼン JS 双方が接続し
@@ -38,7 +38,7 @@ WebSocket ブリッジでは、親プロセスは `ws://127.0.0.1:<ポート>/co
 Tk (app/main.py)
    │ JSON / queue
    ▼
-Bridge server + pywebview (app/presenter.py)
+Bridge server + browser (app/presenter.py)
    │ WebSocket / HTTP (JSON)
    ▼
 Presentation JS (web/app.js)
@@ -49,7 +49,7 @@ Presentation JS (web/app.js)
 - Python 3.10 以上
 - VOICEVOX エンジン（ローカル API を `http://127.0.0.1:50021` で提供）
 - 音声出力が可能な環境（WebAudio を使用）
-- Windows / macOS / Linux で動作確認済み。Windows では Microsoft Edge WebView2 ランタイム（pywebview の `edgechromium` バックエンド）が必須です。未導入の場合は Microsoft 公式サイトからインストールし、必要に応じて `PYWEBVIEW_GUI=edgechromium` を指定してください。
+- Windows / macOS / Linux で動作確認済み。プレゼン画面は既定ブラウザで開かれるため、Chrome / Edge / Firefox などの最新バージョンを推奨します。
 - 親子プロセス間でローカルループバック通信（`127.0.0.1:<動的ポート>`）を使用します。企業ネットワークなどで localhost への WebSocket / HTTP 通信が制限される場合は、適宜許可を与えてください。
 
 ## セットアップ
@@ -82,8 +82,8 @@ python app/main.py --bridge ws --debug
 - `--bridge` を省略すると WebSocket ブリッジが選択されます。HTTP + SSE を試す場合は `--bridge http` を指定してください。
 - `--port` を省略すると、未使用のポートを自動で割り当てます。ファイアウォール設定済みのポートを使う場合のみ明示的に指定します（例: `--port 8765`）。
 - WebSocket ブリッジ時は、親プロセス（`/control`）とプレゼン JS（`/presentation`）が同じポートで待ち合わせます。必ず両方に同一の `--port` を指定してください。
-- `--debug` または環境変数 `DEBUG=1` を指定すると、起動から 30 秒間は親プロセスが WebSocket 接続のリトライ間隔や割り当てポートを、子プロセスが GUI バックエンドと `index.html` の絶対 URL、`WS listening on ws://...` といった診断ログを INFO レベルで出力します。
-- Windows では Microsoft Edge WebView2 ランタイムが必須です。`PYWEBVIEW_GUI=edgechromium` を設定すると Edge バックエンドを強制できます。
+- `--debug` を付けるか、環境変数 `DEBUG=1` を指定すると、起動から 30 秒間は親プロセスが WebSocket 接続のリトライ間隔や割り当てポートを詳細ログで出力します。子プロセスは `Presentation HTTP server running on http://127.0.0.1:xxxxx/` や `Presentation URL: http://127.0.0.1:xxxxx/?mode=...` といった診断ログを記録します。
+- プレゼン画面は起動時に既定ブラウザで自動的に開きます。自動起動に失敗した場合は、ログや標準出力に表示される URL をブラウザで開いてください。
 - VOICEVOX エンジンが未起動でも 10 秒間隔で再検出します。後からエンジンを立ち上げた場合は、コントロール画面で「開始」を押し直せば音声が再取得されます。
 
 ### プロセスを分けてデバッグする場合
@@ -99,7 +99,7 @@ python app/main.py --bridge ws --port 8765 --debug
 - HTTP + SSE フォールバックでは `--bridge http` を両方に指定してください（CORS と OPTIONS 応答は既に有効です）。
 - `ブリッジ` ラベルが「接続中」になってから `READY` イベントが届くと、現在選択中の問題・設定が自動的に再同期されます。切断時は「未接続」に戻り、再接続後に音声プリフェッチが再実行されます。
 
-- **コントロール画面**（Tkinter）と **プレゼン画面**（pywebview）の 2 つのウィンドウが開きます。
+- **コントロール画面**（Tkinter）のウィンドウと、既定ブラウザのタブ（プレゼン画面）が開きます。
 - 初期状態では `samples/sample.quiz.txt` を読み込みます。別ファイルを利用する場合は「クイズを開く」ボタンから選択してください。
 - コントロール画面で問題を選択して「開始」を押すと、プレゼン画面にタイプライタ表示が始まります。
 
@@ -162,7 +162,8 @@ EXPLAIN:
 | 症状 | 対処 |
 | ---- | ---- |
 | VOICEVOX が未起動で音声が出ない | コントロール画面のステータスが「未起動」のままになります。エンジン起動後に再度「開始」を押すと音声が流れます。警告は初回のみ表示され、以後は無音で進行します。 |
-| プレゼン画面が真っ白、もしくは「web/index.html が見つかりません」と表示される | プレゼンプロセスは `web/index.html` を `file:///` の絶対パスで読み込みます。ログに出る探索パスが実際に存在するか確認し、プロジェクトの `web` ディレクトリが移動・削除されていないか見直してください。 |
+| プレゼン画面が真っ白、もしくは「web/index.html が見つかりません」と表示される | 起動ログに `Presentation HTTP server running on http://127.0.0.1:xxxxx/` と `Presentation URL: http://127.0.0.1:xxxxx/?mode=...` が出力されているか確認し、`web/index.html` が存在するかを見直してください。ログが出ていない場合はポート競合や権限エラーが発生している可能性があります。 |
+| DevTools に `Not allowed to load local resource: file:///...` が表示される | 旧バージョンでは `file:///` で読み込んでいたため Edge WebView2 で拒否されました。現在はローカル HTTP サーバー経由（`http://127.0.0.1:xxxxx/`）で配信されるため、ブラウザのアドレスバーが `http://` になっているかとログ出力を確認してください。 |
 | プレゼン画面が古いまま更新されない | プレゼン URL には `?v=タイムスタンプ` が付与されますが、キャッシュが残る場合はプレゼン画面で DevTools を開き `Ctrl+Shift+R`（macOS は `Cmd+Shift+R`）で強制再読み込みしてください。 |
 | RuntimeError: main thread is not in main loop / no running event loop | 最新の 2 プロセス構成では、子プロセス内で専用の asyncio ループを立ち上げています。旧バージョンの `presenter.py` が残っていないか確認し、`WS listening on ws://...` ログが出ているかを `--debug` 付きで確認してください。ポート競合でも同様のエラーになるため、未使用ポートに変更するか、既存プロセスを終了します。 |
 | 接続拒否（WinError 1225 など）で「未接続」から回復しない | `app/presenter.py` が指定ポートで待ち受けているか確認し、ファイアウォールに `127.0.0.1:<ポート>` への WebSocket/HTTP 通信を許可してください。`--debug` で「WebSocket bridge connected/disconnected」のログが循環している場合は、ポートやブリッジ方式を見直します。 |
@@ -178,6 +179,6 @@ EXPLAIN:
 ## 開発者向けメモ
 
 - 親プロセス（`app/main.py`）は Tk メインスレッドで `mainloop()` を実行し、子プロセスを `subprocess.Popen` で起動します。Tk ウィジェット操作はすべて `_drain_ui_queue()` 内（メインスレッド）に集約してください。
-- 子プロセス（`app/presenter.py`）は pywebview ウィンドウとブリッジサーバを同一プロセスで立ち上げます。WebSocket モードでは `websockets`、HTTP モードでは `aiohttp` を使用します。双方とも JSON メッセージのみを送受信し、Tk オブジェクトを参照しません。
-- プレゼン HTML は常に `index_path.resolve().as_uri()` で得た `file:///` 絶対 URL を用いて読み込みます。相対パス指定は白画面やリソース読み込み失敗の原因になります。
-- `--debug` を指定すると、親はブリッジモード・割り当てポートを INFO ログに出力し、子は GUI バックエンドと `index.html` の絶対パスを記録します。動作確認やポート解放確認時に活用してください。
+- 子プロセス（`app/presenter.py`）は `aiohttp` ベースのローカル HTTP サーバーを起動し、静的ファイル配信と WebSocket/SSE ブリッジを同一ポートで提供します。既定ブラウザは `http://127.0.0.1:<ポート>/` を自動的に開きます。
+- WebSocket モードでは `/control` と `/presentation` の 2 つの経路を使って親・プレゼン間のメッセージを仲介します。HTTP モードでは `/api/*` エンドポイントと SSE を使用します。
+- `--debug` を指定すると、親はブリッジモードや割り当てポートを INFO ログに出力し、子は `Presentation HTTP server running ...` や `Presentation URL: ...` を記録します。動作確認やポート解放確認時に活用してください。
