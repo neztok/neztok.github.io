@@ -299,7 +299,7 @@ class BridgeClientBase:
     def start(self) -> None:
         raise NotImplementedError
 
-    def send(self, action: str, data: Optional[Dict] = None) -> None:
+    def send(self, message: Dict) -> None:
         raise NotImplementedError
 
     def close(self) -> None:
@@ -337,7 +337,7 @@ class WebSocketBridgeClient(BridgeClientBase):
                             if not self.connected:
                                 logging.info("WebSocket bridge connected: %s", uri)
                                 self.connected = True
-                                self.callback({"action": "BRIDGE_CONNECTED", "data": {"mode": BRIDGE_WS}})
+                                self.callback({"type": "bridge_connected", "mode": BRIDGE_WS})
                             backoff = 0.5
                             receiver = asyncio.create_task(self._receiver(websocket))
                             sender = asyncio.create_task(self._sender(websocket))
@@ -362,14 +362,14 @@ class WebSocketBridgeClient(BridgeClientBase):
                         if self.connected:
                             logging.info("WebSocket bridge disconnected: %s%s", exc, close_info)
                             self.connected = False
-                            self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_WS}})
+                            self.callback({"type": "bridge_disconnected", "mode": BRIDGE_WS})
                         if self.stop_event.is_set():
                             break
                         await asyncio.sleep(backoff)
                         backoff = min(backoff * 2, 5)
                 if self.connected:
                     self.connected = False
-                    self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_WS}})
+                    self.callback({"type": "bridge_disconnected", "mode": BRIDGE_WS})
 
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
@@ -406,8 +406,8 @@ class WebSocketBridgeClient(BridgeClientBase):
                 break
             await websocket.send(message)
 
-    def send(self, action: str, data: Optional[Dict] = None) -> None:
-        payload = json.dumps({"action": action, "data": data or {}})
+    def send(self, message: Dict) -> None:
+        payload = json.dumps(message)
         self.out_queue.put(payload)
 
     def close(self) -> None:
@@ -508,15 +508,14 @@ class HttpBridgeClient(BridgeClientBase):
     def _handle_status(self, status: str) -> None:
         if status == "connected" and not self.connected:
             self.connected = True
-            self.callback({"action": "BRIDGE_CONNECTED", "data": {"mode": BRIDGE_HTTP}})
+            self.callback({"type": "bridge_connected", "mode": BRIDGE_HTTP})
         elif status == "disconnected" and self.connected:
             self.connected = False
-            self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_HTTP}})
+            self.callback({"type": "bridge_disconnected", "mode": BRIDGE_HTTP})
 
-    def send(self, action: str, data: Optional[Dict] = None) -> None:
-        payload = {"action": action, "data": data or {}}
+    def send(self, message: Dict) -> None:
         try:
-            response = self.session.post(f"{self.base_url}/api/cmd", json=payload, timeout=5)
+            response = self.session.post(f"{self.base_url}/api/cmd", json=message, timeout=5)
             response.raise_for_status()
         except requests.RequestException as exc:
             logging.warning("HTTP bridge send failed: %s", exc)
@@ -527,7 +526,7 @@ class HttpBridgeClient(BridgeClientBase):
             self.reader.join(timeout=1)
         if self.connected:
             self.connected = False
-            self.callback({"action": "BRIDGE_DISCONNECTED", "data": {"mode": BRIDGE_HTTP}})
+            self.callback({"type": "bridge_disconnected", "mode": BRIDGE_HTTP})
 
 
 def find_free_port() -> int:
@@ -536,6 +535,13 @@ def find_free_port() -> int:
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+
+def env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 class PresenterProcess:
@@ -568,18 +574,14 @@ class PresenterProcess:
             self._monitor = threading.Thread(target=self._watch_process, name="PresenterMonitor", daemon=True)
             self._monitor.start()
 
-    def send(self, action: str, data: Optional[Dict] = None) -> None:
+    def send(self, message: Dict) -> None:
         if not self.bridge:
             return
-        self.bridge.send(action, data)
+        self.bridge.send(message)
 
     def stop(self) -> None:
         self._stopping = True
         if self.bridge:
-            try:
-                self.bridge.send("QUIT", {})
-            except Exception:  # pylint: disable=broad-except
-                pass
             self.bridge.close()
         if self.process and self.process.poll() is None:
             self.process.terminate()
@@ -596,7 +598,7 @@ class PresenterProcess:
             if self._stopping:
                 return
             if returncode not in (0, None):
-                self.on_event({"action": "PRESENTER_EXITED", "data": {"returncode": returncode}})
+                self.on_event({"type": "presenter_exited", "payload": {"returncode": returncode}})
         finally:
             self._monitor = None
 
@@ -613,12 +615,12 @@ class QuizApp:
         self.root = tk.Tk()
         self.root.title("Quiz Control")
         self.ui_queue: "queue.Queue[Tuple[str, Optional[Dict]]]" = queue.Queue()
-        self.debug_enabled = debug or os.environ.get("DEBUG") == "1"
+        self.debug_enabled = debug or env_flag("DEBUG")
         self.debug_until = time.time() + 30 if self.debug_enabled else 0.0
         self.presenter = PresenterProcess(bridge_mode, self.debug_enabled, self._handle_bridge_event, port=port)
         self.presenter.start()
         self.current_question: Optional[QuizQuestion] = None
-        self.current_status: Dict[str, int] = {"page": 1, "totalPages": 1, "phraseIndex": 0, "ttsQueue": 0}
+        self.current_status: Dict[str, int] = {"page": 1, "totalPages": 1, "sentenceIndex": 0, "ttsQueue": 0}
         self.tts_manager = TTSManager()
         self.voicevox_alerted = False
         self.executor = ThreadPoolExecutor(max_workers=2)
@@ -634,6 +636,10 @@ class QuizApp:
         self.answer_text = tk.StringVar(value="")
         self.questions_listbox: Optional[tk.Listbox] = None
         self.presentation_ready = False
+        self.seq_lock = threading.Lock()
+        self.active_seq = 0
+        self.seq_token: object = object()
+        self.current_page_index = 0
         self.closing = False
         self.create_control_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -655,8 +661,56 @@ class QuizApp:
             return
         logging.debug("[thread:%s] " + message, threading.current_thread().name, *args)
 
+    def _next_sequence(self) -> Tuple[int, object]:
+        with self.seq_lock:
+            self.active_seq = (self.active_seq + 1) & 0x7FFFFFFF
+            self.seq_token = object()
+            return self.active_seq, self.seq_token
+
+    def _current_sequence(self) -> Tuple[int, object]:
+        with self.seq_lock:
+            return self.active_seq, self.seq_token
+
+    def _is_current_sequence(self, seq: int, token: object) -> bool:
+        with self.seq_lock:
+            return seq == self.active_seq and token is self.seq_token
+
+    def _announce_sequence(self, seq: int) -> None:
+        self.presenter.send({"type": "page_seq", "seq": seq})
+
+    def _send_settings(self) -> None:
+        if not self.presentation_ready:
+            return
+        seq, _ = self._current_sequence()
+        payload = {
+            "cps": self.cps_var.get(),
+            "pauseFactor": round(self.pause_factor_var.get(), 2),
+            "zoom": round(self.zoom_var.get(), 2),
+            "compact": bool(self.compact_var.get()),
+        }
+        message: Dict[str, object] = {"type": "settings", "payload": payload}
+        if seq:
+            message["seq"] = seq
+        self.presenter.send(message)
+
+    def _send_present(self, page_index: int) -> None:
+        if not self.presentation_ready or not self.current_question:
+            return
+        seq, _ = self._next_sequence()
+        self.current_page_index = max(0, page_index)
+        payload = self.create_question_payload(self.current_question)
+        payload["page"] = self.current_page_index
+        self._announce_sequence(seq)
+        self.presenter.send({"type": "present", "seq": seq, "payload": payload})
+        self._send_settings()
+
+    def _send_clear(self, reason: str) -> None:
+        seq, _ = self._next_sequence()
+        self._announce_sequence(seq)
+        self.presenter.send({"type": "clear", "seq": seq, "payload": {"reason": reason}})
+
     def _handle_bridge_event(self, payload: Dict) -> None:
-        self.ui_queue.put((payload.get("action", ""), payload.get("data")))
+        self.ui_queue.put(payload)
 
     def create_control_ui(self) -> None:
         main_frame = ttk.Frame(self.root, padding=12)
@@ -726,49 +780,58 @@ class QuizApp:
     def _drain_ui_queue(self) -> None:
         try:
             while True:
-                event, payload = self.ui_queue.get_nowait()
-                self._debug("dispatch %s", event)
-                self._handle_event(event, payload)
+                message = self.ui_queue.get_nowait()
+                if not isinstance(message, dict):
+                    continue
+                event_type = message.get("type", "")
+                self._debug("dispatch %s", event_type)
+                self._handle_event(message)
         except queue.Empty:
             pass
         if not self.closing:
             self.root.after(50, self._drain_ui_queue)
 
-    def _handle_event(self, event: str, payload: Optional[Dict]) -> None:
-        if event == "READY":
+    def _handle_event(self, message: Dict) -> None:
+        event = message.get("type") if isinstance(message, dict) else None
+        if not event:
+            return
+        if event == "ready":
             self.on_presentation_ready()
-        elif event == "STATUS":
+        elif event == "presenter_ready":
+            self._debug("presenter acknowledged user interaction")
+        elif event == "status":
+            payload = message.get("payload")
             if isinstance(payload, dict):
                 self.update_status(payload)
-        elif event == "TTS_REQUEST":
-            if isinstance(payload, dict):
-                self.handle_tts_request(payload)
-        elif event == "ERROR":
-            logging.error("Presentation error: %s", payload)
-        elif event == "FINISHED":
+        elif event == "tts_request":
+            self.handle_tts_request(message)
+        elif event == "error":
+            logging.error("Presentation error: %s", message.get("payload"))
+        elif event == "finished":
             messagebox.showinfo("情報", "プレゼンテーションが終了しました。")
-        elif event == "PONG":
+        elif event == "pong":
             pass
-        elif event == "BRIDGE_CONNECTED":
+        elif event == "bridge_connected":
             self.bridge_var.set("接続中")
-        elif event == "BRIDGE_DISCONNECTED":
+        elif event == "bridge_disconnected":
             self.bridge_var.set("未接続")
             self.presentation_ready = False
             self.voicevox_var.set("未確認")
             self.voicevox_alerted = False
-        elif event == "PRESENTATION_DISCONNECTED":
+        elif event == "presentation_disconnected":
             self.bridge_var.set("未接続")
             self.presentation_ready = False
             self.voicevox_var.set("未確認")
             self.voicevox_alerted = False
-        elif event == "PRESENTER_EXITED":
+        elif event == "presenter_exited":
             self.bridge_var.set("停止")
             self.presentation_ready = False
-            if payload and not self.closing:
+            payload = message.get("payload")
+            if isinstance(payload, dict) and not self.closing:
                 code = payload.get("returncode")
                 if code not in (0, None):
                     messagebox.showerror("プレゼン停止", f"プレゼンテーションプロセスが終了しました (code={code})")
-        elif event == "VOICEVOX_UNAVAILABLE":
+        elif event == "voicevox_unavailable":
             if self.voicevox_alerted:
                 messagebox.showwarning("VOICEVOX", "VOICEVOX が起動していない可能性があります。")
 
@@ -777,8 +840,6 @@ class QuizApp:
             return
         self.presentation_ready = True
         self.bridge_var.set("接続中")
-        self._debug("sending presentation init handshake")
-        self.presenter.send("presentation_init", {"type": "PRESENTATION_INIT"})
         available = self.tts_manager.check_service()
         if available:
             self.voicevox_var.set("起動中")
@@ -788,48 +849,74 @@ class QuizApp:
             self.voicevox_alerted = True
         if self.current_question is None and self.questions:
             self.set_current_question(0)
-        self.sync_current_settings()
+        if self.current_question:
+            self._send_present(self.current_page_index)
+        else:
+            self._send_settings()
 
     def update_status(self, payload: Dict[str, int]) -> None:
         page = payload.get("page", 1)
         total = payload.get("totalPages", 1)
-        phrase = payload.get("phraseIndex", 0)
+        sentence = payload.get("sentenceIndex", 0)
         queue_len = payload.get("ttsQueue", 0)
         self.current_status = payload
         self.page_var.set(f"{page}/{total}")
-        self.phrase_var.set(str(phrase))
+        self.phrase_var.set(str(sentence))
         self.queue_var.set(str(queue_len))
 
-    def handle_tts_request(self, payload: Dict) -> None:
-        slices = payload.get("slice")
-        if not isinstance(slices, list) or not self.current_question:
+    def handle_tts_request(self, message: Dict) -> None:
+        if not self.current_question:
             return
         question = self.current_question
+        seq = int(message.get("seq", 0))
+        sentence = message.get("sentence") or {}
+        index = int(sentence.get("index", -1))
+        start = int(sentence.get("start", -1))
+        end = int(sentence.get("end", -1))
+        if seq <= 0 or index < 0 or start < 0 or end <= start:
+            return
+        active_seq, token = self._current_sequence()
+        if seq != active_seq:
+            self._debug("ignore tts request for seq=%s (active=%s)", seq, active_seq)
+            return
 
         def worker() -> None:
-            chunks = []
-            for item in slices:
-                start = int(item.get("startChar", 0))
-                end = int(item.get("endChar", 0))
-                segments = question.get_tts_segments(start, end)
-                texts = []
-                for text, is_kana in segments:
-                    if len(text) > MAX_CHARS_PER_TTS:
-                        for idx in range(0, len(text), MAX_CHARS_PER_TTS):
-                            texts.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
-                    else:
-                        texts.append((text, is_kana))
-                for text, is_kana in texts:
-                    wav = self.tts_manager.synthesize(text, is_kana=is_kana)
+            segments = question.get_tts_segments(start, end)
+            if not segments:
+                return
+            chunks: List[str] = []
+            for text, is_kana in segments:
+                if not text:
+                    continue
+                pieces: List[Tuple[str, bool]] = []
+                if len(text) > MAX_CHARS_PER_TTS:
+                    for idx in range(0, len(text), MAX_CHARS_PER_TTS):
+                        pieces.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
+                else:
+                    pieces.append((text, is_kana))
+                for fragment, kana_flag in pieces:
+                    if not self._is_current_sequence(seq, token):
+                        return
+                    wav = self.tts_manager.synthesize(fragment, is_kana=kana_flag)
                     if wav:
-                        chunk_id = f"chunk-{len(chunks)}"
-                        chunks.append({"id": chunk_id, "wavBase64": wav})
-            if chunks:
-                for chunk in chunks:
-                    self.presenter.send("play_chunk", chunk)
-            elif not self.voicevox_alerted:
-                self.voicevox_alerted = True
-                self.ui_queue.put(("VOICEVOX_UNAVAILABLE", None))
+                        chunks.append(wav)
+            if not chunks:
+                if not self.voicevox_alerted:
+                    self.voicevox_alerted = True
+                    self.ui_queue.put({"type": "voicevox_unavailable"})
+                return
+            if not self._is_current_sequence(seq, token):
+                return
+            payload = {
+                "type": "tts_sentence",
+                "seq": seq,
+                "sentence_index": index,
+                "chunks": [
+                    {"id": f"{seq}-{index}-{idx}", "audio": chunk}
+                    for idx, chunk in enumerate(chunks)
+                ],
+            }
+            self.presenter.send(payload)
 
         self.executor.submit(worker)
 
@@ -841,26 +928,21 @@ class QuizApp:
             "explain": question.explain,
         }
 
-    def sync_current_settings(self) -> None:
-        if not self.presentation_ready or not self.current_question:
-            return
-        self.presenter.send("load_question", self.create_question_payload(self.current_question))
-        self.presenter.send("set_cps", {"value": self.cps_var.get()})
-        self.presenter.send("set_pause_factor", {"value": round(self.pause_factor_var.get(), 2)})
-        self.presenter.send("set_zoom", {"value": round(self.zoom_var.get(), 2)})
-        self.presenter.send("set_compact", {"value": bool(self.compact_var.get())})
-
     def set_current_question(self, index: int) -> None:
         if index < 0 or index >= len(self.questions):
             return
         self.current_question = self.questions[index]
         answers = " / ".join(self.current_question.answers)
         self.answer_text.set(answers)
+        self.current_page_index = 0
         if self.questions_listbox:
             self.questions_listbox.select_clear(0, tk.END)
             self.questions_listbox.select_set(index)
             self.questions_listbox.activate(index)
-        self.sync_current_settings()
+        if self.presentation_ready:
+            self._send_present(0)
+        else:
+            self._send_settings()
 
     def on_select_question(self, event) -> None:
         if not self.questions_listbox:
@@ -873,44 +955,57 @@ class QuizApp:
         if not self.presentation_ready or not self.current_question:
             messagebox.showwarning("未接続", "プレゼン画面が未接続です。")
             return
-        self.presenter.send("start", {})
+        seq, _ = self._current_sequence()
+        if not seq:
+            self._send_present(self.current_page_index)
+            seq, _ = self._current_sequence()
+        self.presenter.send({"type": "start", "seq": seq})
 
     def stop_presentation(self, reason: str) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("stop_all", {"reason": reason})
+        self._send_clear(reason)
 
     def resume_presentation(self) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("resume", {})
+        seq, _ = self._current_sequence()
+        if seq:
+            self.presenter.send({"type": "start", "seq": seq, "payload": {"resume": True}})
 
     def reveal_answer(self) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("reveal_answer", {})
+        seq, _ = self._current_sequence()
+        if not seq or not self.current_question:
+            return
+        payload = {
+            "answers": self.current_question.answers,
+            "explain": self.current_question.explain,
+        }
+        self.presenter.send({"type": "reveal", "seq": seq, "payload": payload})
 
     def update_cps(self) -> None:
         value = max(10, min(18, self.cps_var.get()))
         self.cps_var.set(value)
         if self.presentation_ready:
-            self.presenter.send("set_cps", {"value": value})
+            self._send_settings()
 
     def update_pause_factor(self) -> None:
         value = max(0.8, min(1.4, float(self.pause_factor_var.get())))
         self.pause_factor_var.set(value)
         if self.presentation_ready:
-            self.presenter.send("set_pause_factor", {"value": round(value, 2)})
+            self._send_settings()
 
     def update_zoom(self) -> None:
         value = max(0.85, min(1.4, float(self.zoom_var.get())))
         self.zoom_var.set(value)
         if self.presentation_ready:
-            self.presenter.send("set_zoom", {"value": round(value, 2)})
+            self._send_settings()
 
     def update_compact(self) -> None:
         if self.presentation_ready:
-            self.presenter.send("set_compact", {"value": bool(self.compact_var.get())})
+            self._send_settings()
 
     def load_quiz_file(self) -> None:
         file_path = filedialog.askopenfilename(filetypes=[("Quiz", "*.txt"), ("All", "*.*")])
@@ -946,16 +1041,20 @@ class QuizApp:
 
     def handle_page_down(self, event) -> None:  # type: ignore[override]
         del event
+        if not self.presentation_ready:
+            return
         current = max(self.current_status.get("page", 1) - 1, 0)
         total = max(self.current_status.get("totalPages", 1), 1)
         next_page = min(current + 1, total - 1)
-        self.presenter.send("goto_page", {"page": next_page})
+        self._send_present(next_page)
 
     def handle_page_up(self, event) -> None:  # type: ignore[override]
         del event
+        if not self.presentation_ready:
+            return
         current = max(self.current_status.get("page", 1) - 1, 0)
         prev_page = max(current - 1, 0)
-        self.presenter.send("goto_page", {"page": prev_page})
+        self._send_present(prev_page)
 
     def handle_escape(self, event) -> None:  # type: ignore[override]
         del event
@@ -985,8 +1084,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv or sys.argv[1:])
-    logging.basicConfig(level=logging.DEBUG if args.debug or os.environ.get("DEBUG") == "1" else logging.INFO)
-    app = QuizApp(args.quiz, args.bridge, debug=args.debug, port=args.port)
+    debug_enabled = args.debug or env_flag("DEBUG")
+    logging.basicConfig(level=logging.DEBUG if debug_enabled else logging.INFO)
+    app = QuizApp(args.quiz, args.bridge, debug=debug_enabled, port=args.port)
     try:
         app.run()
     finally:

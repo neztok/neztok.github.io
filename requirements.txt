@@ -1,5 +1,4 @@
 # Core UI and VOICEVOX integration
-pywebview>=6,<7
 requests>=2.31,<3
 typing_extensions>=4.7,<5
 
