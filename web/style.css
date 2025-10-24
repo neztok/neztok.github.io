@@ -147,30 +147,49 @@ body {
 }
 
 #answerPanel {
-  margin-top: 24px;
-  padding: 12px 16px;
-  background: rgba(255, 255, 255, 0.95);
-  border-left: 4px solid var(--accent);
-  border-radius: 4px;
-  max-width: var(--content-max-width);
-  line-height: 1.5;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: clamp(16px, 4vw, 32px);
+  background: rgba(20, 24, 32, 0.88);
+  color: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 24px 48px rgba(0, 0, 0, 0.35);
+  width: min(90vw, var(--content-max-width));
+  max-width: min(90vw, var(--content-max-width));
+  max-height: min(80vh, 640px);
+  overflow-y: auto;
+  text-align: center;
+  padding-inline: clamp(16px, 6vw, 48px);
+  box-sizing: border-box;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  border: 2px solid rgba(255, 255, 255, 0.35);
 }
 
 #answerPanel h2 {
-  margin: 0 0 8px;
-  font-size: 24px;
+  margin: 0;
+  font-size: clamp(20px, 2.6vw, 32px);
+  letter-spacing: 0.08em;
 }
 
 #answers {
-  font-size: 22px;
+  font-size: clamp(18px, 2.4vw, 30px);
   margin: 0;
+  font-weight: 600;
 }
 
 #explain {
-  margin-top: 8px;
-  font-size: 18px;
-  opacity: 0.85;
+  font-size: clamp(16px, 2vw, 24px);
+  opacity: 0.92;
   white-space: pre-wrap;
+  line-height: 1.6;
 }
 
 body:not(.show-answer) #answerPanel {
@@ -178,7 +197,7 @@ body:not(.show-answer) #answerPanel {
 }
 
 body.show-answer #answerPanel {
-  display: block;
+  display: flex;
 }
 
 #contentShell.auto-scroll #content {

@@ -153,20 +153,21 @@ const state = {
   pauseFactor: 1.0,
   zoom: 1.1,
   compact: true,
-  running: false,
   phraseIndex: 0,
-  requestedChunks: new Set(),
-  ttsControllers: new Map(),
-  currentAudioId: null,
   autoScroll: false,
   statusHint: '',
   connectionStage: 'disconnected',
+  readyByUser: false,
+  activeSeq: 0,
 };
 
 const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 
 let elements = {};
 let statusFrameToken = null;
+let userReadyResolvers = [];
+const pendingTtsRequests = new Map();
+let flowController = null;
 let readyNotified = false;
 
 const CONNECTION_LABELS = {
@@ -185,6 +186,114 @@ function updateConnectionBadge() {
 function setConnectionStage(stage) {
   state.connectionStage = stage;
   updateConnectionBadge();
+}
+
+function waitForUserReady() {
+  if (state.readyByUser) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    userReadyResolvers.push(resolve);
+  });
+}
+
+function markUserReady() {
+  if (state.readyByUser) {
+    return;
+  }
+  state.readyByUser = true;
+  audioManager.resumeContext();
+  const resolvers = userReadyResolvers.splice(0);
+  resolvers.forEach((resolve) => {
+    try {
+      resolve();
+    } catch (err) {
+      console.error('user-ready resolver failed', err);
+    }
+  });
+  sendCommand('USER_READY', { at: Date.now() });
+}
+
+function setupUserReadyListeners() {
+  const handler = () => {
+    markUserReady();
+    window.removeEventListener('pointerdown', handler);
+    window.removeEventListener('keydown', handler);
+  };
+  window.addEventListener('pointerdown', handler, { once: true });
+  window.addEventListener('keydown', handler, { once: true });
+}
+
+function cancelFlowController(reason = 'cancelled') {
+  if (flowController) {
+    const { controller } = flowController;
+    if (controller && !controller.signal.aborted) {
+      try {
+        controller.abort();
+      } catch (err) {
+        console.error('flow abort failed', err);
+      }
+    }
+  }
+  flowController = null;
+  typewriter.cancel(reason);
+  audioManager.stopCurrent();
+}
+
+function rejectPendingTts(reason) {
+  pendingTtsRequests.forEach((entry, key) => {
+    pendingTtsRequests.delete(key);
+    try {
+      entry.reject(new Error(reason || 'cancelled'));
+    } catch (err) {
+      console.error('reject tts failed', err);
+    }
+  });
+}
+
+function activateSequence(seq) {
+  if (typeof seq !== 'number' || Number.isNaN(seq)) {
+    return state.activeSeq;
+  }
+  if (seq < state.activeSeq) {
+    return state.activeSeq;
+  }
+  if (seq > state.activeSeq) {
+    state.activeSeq = seq;
+    cancelFlowController('sequence-changed');
+    rejectPendingTts('sequence-changed');
+    audioManager.flush();
+    state.typedLength = 0;
+    state.phraseIndex = 0;
+    scheduleStatus();
+  }
+  return state.activeSeq;
+}
+
+function ensureSequence(data = {}) {
+  if (!data || typeof data.seq === 'undefined') {
+    return true;
+  }
+  const seq = Number.parseInt(data.seq, 10);
+  if (Number.isNaN(seq)) {
+    return true;
+  }
+  if (seq < state.activeSeq) {
+    return false;
+  }
+  activateSequence(seq);
+  return true;
+}
+
+function createFlowController(seq) {
+  cancelFlowController('replaced');
+  const controller = new AbortController();
+  flowController = { controller, seq };
+  return flowController;
+}
+
+function currentFlowController() {
+  return flowController;
 }
 
 const params = new URLSearchParams(window.location.search || '');
@@ -482,9 +591,13 @@ function setBridgeReceiver(handler) {
   }
 }
 
-function sendCommand(action, data = {}) {
+function sendCommand(action, data = {}, options = {}) {
   const bridge = ensureBridge();
-  bridge.send({ action, data });
+  const payload = { ...(data || {}) };
+  if (options.includeSeq !== false && typeof payload.seq === 'undefined') {
+    payload.seq = state.activeSeq;
+  }
+  bridge.send({ action, data: payload });
 }
 
 function segmentGraphemes(text) {
@@ -678,70 +791,149 @@ function updateScroll(page) {
   elements.contentShell.scrollTop = maxScroll * ratio;
 }
 
-function cancelAllTtsRequests() {
-  for (const controller of state.ttsControllers.values()) {
-    try {
-      controller.abort();
-    } catch (err) {
-      // Ignore abort errors
-    }
-  }
-  state.ttsControllers.clear();
-}
-
-function resetTtsPrefetch(options = {}) {
-  const { flushAudio = false } = options;
+function resetPlaybackState(options = {}) {
+  const { flushAudio = false, resetIndex = true } = options;
+  cancelFlowController('reset');
   if (flushAudio) {
     audioManager.flush();
   }
-  cancelAllTtsRequests();
-  state.requestedChunks.clear();
-  state.currentAudioId = null;
+  rejectPendingTts('reset');
+  if (resetIndex) {
+    state.phraseIndex = 0;
+  }
   scheduleStatus();
 }
 
-function requestAudioForUpcoming() {
-  const page = currentPage();
-  if (!page) return;
-  const ahead = 3;
-  for (let offset = 0; offset < ahead; offset += 1) {
-    const index = state.phraseIndex + offset;
-    if (index >= page.phrases.length) continue;
-    const phrase = page.phrases[index];
-    if (!phrase || phrase.end <= phrase.start) continue;
-    const chunkId = `${state.pageIndex}-${index}`;
-    if (state.requestedChunks.has(chunkId)) continue;
-    state.requestedChunks.add(chunkId);
-    const controller = new AbortController();
-    state.ttsControllers.set(chunkId, controller);
-    sendCommand('TTS_REQUEST', {
-      slice: [
-        {
-          id: chunkId,
-          startChar: page.start + phrase.start,
-          endChar: page.start + phrase.end,
-        },
-      ],
-    });
-    controller.signal.addEventListener('abort', () => {
-      state.requestedChunks.delete(chunkId);
-      state.ttsControllers.delete(chunkId);
-    });
+function registerTtsPromise(requestId, seq, resolve, reject) {
+  pendingTtsRequests.set(requestId, { resolve, reject, seq });
+}
+
+function settleTtsPromise(requestId, callback) {
+  const entry = pendingTtsRequests.get(requestId);
+  if (!entry) {
+    return;
+  }
+  pendingTtsRequests.delete(requestId);
+  try {
+    callback(entry);
+  } catch (err) {
+    console.error('tts callback failed', err);
   }
 }
 
-function updatePhraseProgress(page) {
-  let completed = 0;
-  for (let i = 0; i < page.phrases.length; i += 1) {
-    if (state.typedLength >= page.phrases[i].end) {
-      completed = i + 1;
-    } else {
-      break;
+function requestSentenceAudio({ seq, requestId, startChar, endChar }) {
+  return new Promise((resolve, reject) => {
+    registerTtsPromise(requestId, seq, resolve, reject);
+    sendCommand(
+      'TTS_REQUEST',
+      {
+        seq,
+        requestId,
+        slice: [
+          {
+            id: requestId,
+            startChar,
+            endChar,
+          },
+        ],
+      },
+      { includeSeq: false },
+    );
+  });
+}
+
+function computeSentenceStart(page, phrase) {
+  if (!page || !phrase) {
+    return 0;
+  }
+  return Math.max(0, Math.min(phrase.start, page.graphemes.length));
+}
+
+function computeSentenceEnd(page, phrase) {
+  if (!page || !phrase) {
+    return 0;
+  }
+  return Math.max(0, Math.min(phrase.end, page.graphemes.length));
+}
+
+function createTtsRequestId(seq, pageIndex, sentenceIndex) {
+  return `${seq}:${pageIndex}:${sentenceIndex}:${Date.now()}`;
+}
+
+async function playSentence(flow, page, sentenceIndex) {
+  const phrase = page.phrases[sentenceIndex];
+  if (!phrase) {
+    state.phraseIndex = sentenceIndex + 1;
+    scheduleStatus();
+    return true;
+  }
+  const seq = flow.seq;
+  const signal = flow.controller.signal;
+  if (signal.aborted || seq !== state.activeSeq) {
+    return false;
+  }
+  const requestId = createTtsRequestId(seq, state.pageIndex, sentenceIndex);
+  const startChar = page.start + computeSentenceStart(page, phrase);
+  const endChar = page.start + computeSentenceEnd(page, phrase);
+  const ttsPromise = requestSentenceAudio({ seq, requestId, startChar, endChar }).catch(() => []);
+  try {
+    await typewriter.revealTo(page, computeSentenceEnd(page, phrase), flow);
+  } catch (err) {
+    return false;
+  }
+  state.typedLength = Math.max(state.typedLength, computeSentenceEnd(page, phrase));
+  setDisplayedText(page, state.typedLength);
+  updateScroll(page);
+  if (signal.aborted || seq !== state.activeSeq) {
+    return false;
+  }
+  let chunks = [];
+  try {
+    chunks = await ttsPromise;
+  } catch (err) {
+    chunks = [];
+  }
+  if (signal.aborted || seq !== state.activeSeq) {
+    return false;
+  }
+  if (Array.isArray(chunks) && chunks.length) {
+    await audioManager.playChunks(chunks, { controller: flow.controller, seq });
+  }
+  if (signal.aborted || seq !== state.activeSeq) {
+    return false;
+  }
+  state.phraseIndex = sentenceIndex + 1;
+  scheduleStatus();
+  return true;
+}
+
+async function runPresentationFlow(startSentence = 0) {
+  const page = currentPage();
+  if (!page || !page.phrases) {
+    return;
+  }
+  const seq = state.activeSeq;
+  const flow = createFlowController(seq);
+  if (!flow) {
+    return;
+  }
+  const { controller } = flow;
+  if (!controller) {
+    return;
+  }
+  state.phraseIndex = Math.max(0, Math.min(startSentence, page.phrases.length));
+  for (let index = startSentence; index < page.phrases.length; index += 1) {
+    if (controller.signal.aborted || seq !== state.activeSeq) {
+      return;
+    }
+    const ok = await playSentence(flow, page, index);
+    if (!ok) {
+      return;
     }
   }
-  if (completed !== state.phraseIndex) {
-    state.phraseIndex = completed;
-    requestAudioForUpcoming();
+  if (!controller.signal.aborted && seq === state.activeSeq) {
+    setStatusHint('完了');
+    scheduleStatus();
   }
 }
 
@@ -786,9 +978,9 @@ function populateAnswerPanel(question) {
 
 const audioManager = {
   context: null,
-  queue: [],
   currentSource: null,
-  playing: false,
+  playbackSeq: 0,
+  pendingCount: 0,
 
   getContext() {
     if (this.context) {
@@ -804,65 +996,123 @@ const audioManager = {
 
   ensureContext() {
     const ctx = this.getContext();
+    if (ctx && ctx.state === 'suspended' && state.readyByUser) {
+      ctx.resume().catch(() => {});
+    }
+    return ctx;
+  },
+
+  resumeContext() {
+    const ctx = this.getContext();
     if (ctx && ctx.state === 'suspended') {
       ctx.resume().catch(() => {});
     }
   },
 
-  async enqueue(id, base64) {
-    const ctx = this.getContext();
-    if (!ctx) return;
+  async decode(base64) {
+    const ctx = this.ensureContext();
+    if (!ctx) {
+      return null;
+    }
     try {
-      this.ensureContext();
-      const buffer = await ctx.decodeAudioData(base64ToArrayBuffer(base64));
-      this.queue.push({ id, buffer });
-      this.playNext();
+      return await ctx.decodeAudioData(base64ToArrayBuffer(base64));
     } catch (err) {
       reportError('audio_decode_failed', err);
+      return null;
     }
+  },
+
+  async playChunks(chunks, meta) {
+    if (!Array.isArray(chunks) || !chunks.length) {
+      return;
+    }
+    const { controller, seq } = meta;
+    if (!controller || controller.signal.aborted) {
+      return;
+    }
+    this.playbackSeq = seq;
+    this.pendingCount = chunks.length;
+    scheduleStatus();
+    for (const item of chunks) {
+      if (controller.signal.aborted || seq !== state.activeSeq) {
+        break;
+      }
+      const base64 = typeof item === 'string' ? item : item && item.wavBase64;
+      if (!base64) {
+        this.pendingCount -= 1;
+        continue;
+      }
+      const buffer = await this.decode(base64);
+      if (!buffer) {
+        this.pendingCount -= 1;
+        continue;
+      }
+      if (controller.signal.aborted || seq !== state.activeSeq) {
+        break;
+      }
+      try {
+        await this.playBuffer(buffer, meta);
+      } catch (err) {
+        reportError('audio_start_failed', err);
+        break;
+      } finally {
+        this.pendingCount -= 1;
+        scheduleStatus();
+      }
+    }
+    this.playbackSeq = 0;
+    this.pendingCount = Math.max(0, this.pendingCount);
     scheduleStatus();
   },
 
-  playNext() {
-    if (this.playing) {
-      return;
-    }
-    const ctx = this.getContext();
-    if (!ctx) return;
-    const next = this.queue.shift();
-    if (!next) {
-      state.currentAudioId = null;
-      scheduleStatus();
-      return;
-    }
-    const source = ctx.createBufferSource();
-    source.buffer = next.buffer;
-    source.connect(ctx.destination);
-    source.onended = () => {
-      this.playing = false;
-      this.currentSource = null;
-      state.currentAudioId = null;
-      this.playNext();
-    };
-    this.currentSource = source;
-    this.playing = true;
-    state.currentAudioId = next.id || null;
-    try {
-      source.start();
-    } catch (err) {
-      this.playing = false;
-      this.currentSource = null;
-      state.currentAudioId = null;
-      reportError('audio_start_failed', err);
-    }
-    scheduleStatus();
-  },
-
-  flush() {
-    this.stopCurrent();
-    this.queue = [];
-    state.currentAudioId = null;
-    scheduleStatus();
+  playBuffer(buffer, meta) {
+    return new Promise((resolve) => {
+      const ctx = this.ensureContext();
+      if (!ctx) {
+        resolve();
+        return;
+      }
+      if (meta.controller.signal.aborted || meta.seq !== state.activeSeq) {
+        resolve();
+        return;
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const cleanup = () => {
+        if (this.currentSource === source) {
+          this.currentSource = null;
+        }
+        source.onended = null;
+        if (signal) {
+          signal.removeEventListener('abort', abortHandler);
+        }
+        resolve();
+      };
+      source.onended = cleanup;
+      const abortHandler = () => {
+        try {
+          source.stop();
+        } catch (err) {
+          console.debug('audio stop error', err);
+        }
+        cleanup();
+      };
+      const signal = meta.controller.signal;
+      if (signal) {
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
+      this.currentSource = source;
+      try {
+        source.start();
+      } catch (err) {
+        if (signal) {
+          signal.removeEventListener('abort', abortHandler);
+        }
+        this.currentSource = null;
+        throw err;
+      }
+    });
   },
 
   stopCurrent() {
@@ -870,17 +1120,26 @@ const audioManager = {
       try {
         this.currentSource.stop();
       } catch (err) {
-        reportError('audio_stop_failed', err);
+        console.debug('audio stop failed', err);
       }
-      this.currentSource.disconnect();
+      try {
+        this.currentSource.disconnect();
+      } catch (err) {
+        console.debug('audio disconnect failed', err);
+      }
       this.currentSource = null;
-      this.playing = false;
     }
-    state.currentAudioId = null;
+    this.playbackSeq = 0;
+    this.pendingCount = 0;
+    scheduleStatus();
+  },
+
+  flush() {
+    this.stopCurrent();
   },
 
   queueLength() {
-    return this.queue.length + (this.playing ? 1 : 0);
+    return (this.currentSource ? 1 : 0) + this.pendingCount;
   },
 };
 
@@ -888,78 +1147,98 @@ const typewriter = {
   rafId: null,
   running: false,
   lastTimestamp: 0,
+  completion: null,
+  targetLength: 0,
+  controller: null,
 
-  start(fromIndex = 0) {
-    const page = currentPage();
-    if (!page) return;
-    this.stop();
-    state.typedLength = Math.max(0, Math.min(fromIndex, page.graphemes.length));
-    state.phraseIndex = 0;
-    setDisplayedText(page, state.typedLength);
-    updateScroll(page);
-    this.running = true;
-    this.lastTimestamp = performance.now();
-    audioManager.ensureContext();
-    requestAudioForUpcoming();
-    this.rafId = requestAnimationFrame(this.step.bind(this));
-    setStatusHint('進行中');
-    scheduleStatus();
-  },
-
-  resume() {
-    const page = currentPage();
-    if (!page) return;
-    if (this.running || state.typedLength >= page.graphemes.length) {
+  async revealTo(page, targetLength, flow) {
+    this.cancel('replaced');
+    const limit = Math.max(0, Math.min(targetLength, page.graphemes.length));
+    if (state.typedLength > limit) {
+      state.typedLength = limit;
+      setDisplayedText(page, state.typedLength);
+      updateScroll(page);
+    }
+    if (state.typedLength === limit) {
       return;
     }
     this.running = true;
     this.lastTimestamp = performance.now();
-    audioManager.ensureContext();
-    requestAudioForUpcoming();
-    this.rafId = requestAnimationFrame(this.step.bind(this));
-    setStatusHint('再開');
-    scheduleStatus();
+    this.targetLength = limit;
+    this.controller = flow;
+    const signal = flow && flow.controller ? flow.controller.signal : null;
+    const seq = flow && typeof flow.seq === 'number' ? flow.seq : state.activeSeq;
+    return new Promise((resolve, reject) => {
+      this.completion = { resolve, reject };
+      const step = (timestamp) => {
+        if (!this.running) {
+          return;
+        }
+        if ((signal && signal.aborted) || seq !== state.activeSeq) {
+          this.cancel('aborted');
+          return;
+        }
+        if (state.typedLength >= this.targetLength) {
+          this.finish();
+          return;
+        }
+        if (!this.lastTimestamp) {
+          this.lastTimestamp = timestamp;
+        }
+        const delay = computeDelay(page, state.typedLength);
+        if (timestamp - this.lastTimestamp >= delay) {
+          state.typedLength += 1;
+          setDisplayedText(page, state.typedLength);
+          updateScroll(page);
+          scheduleStatus();
+          this.lastTimestamp = timestamp;
+        }
+        this.rafId = requestAnimationFrame(step);
+      };
+      this.rafId = requestAnimationFrame(step);
+    });
   },
 
-  stop(withFlash = false) {
+  finish() {
     if (this.rafId) {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
     this.running = false;
-    if (withFlash) {
-      flashOverlay();
+    const completion = this.completion;
+    this.completion = null;
+    if (completion) {
+      try {
+        completion.resolve();
+      } catch (err) {
+        console.error('typewriter resolve failed', err);
+      }
+    }
+    scheduleStatus();
+  },
+
+  cancel(reason = 'cancelled') {
+    if (this.rafId) {
+      cancelAnimationFrame(this.rafId);
+      this.rafId = null;
+    }
+    const completion = this.completion;
+    this.completion = null;
+    this.running = false;
+    if (completion) {
+      try {
+        completion.reject(new Error(reason));
+      } catch (err) {
+        console.error('typewriter reject failed', err);
+      }
     }
   },
 
-  step(timestamp) {
-    if (!this.running) {
-      return;
+  stop(withFlash = false) {
+    this.cancel('stopped');
+    if (withFlash) {
+      flashOverlay();
     }
-    const page = currentPage();
-    if (!page) {
-      this.stop();
-      return;
-    }
-    if (state.typedLength >= page.graphemes.length) {
-      this.stop();
-      setStatusHint('完了');
-      scheduleStatus();
-      return;
-    }
-    if (!this.lastTimestamp) {
-      this.lastTimestamp = timestamp;
-    }
-    const delay = computeDelay(page, state.typedLength);
-    if (timestamp - this.lastTimestamp >= delay) {
-      state.typedLength += 1;
-      setDisplayedText(page, state.typedLength);
-      updatePhraseProgress(page);
-      updateScroll(page);
-      scheduleStatus();
-      this.lastTimestamp = timestamp;
-    }
-    this.rafId = requestAnimationFrame(this.step.bind(this));
   },
 };
 
@@ -1000,7 +1279,7 @@ async function setPage(index, options = {}) {
   typewriter.stop();
   state.typedLength = 0;
   state.phraseIndex = 0;
-  resetTtsPrefetch({ flushAudio: options.flushAudio !== false });
+  resetPlaybackState({ flushAudio: options.flushAudio !== false });
   if (elements.content) {
     elements.content.textContent = '';
   }
@@ -1009,8 +1288,10 @@ async function setPage(index, options = {}) {
   }
   updatePageIndicator();
   await fitContent(page);
+  if (page) {
+    setDisplayedText(page, state.typedLength);
+  }
   scheduleStatus();
-  requestAudioForUpcoming();
 }
 
 function reportError(code, error) {
@@ -1021,6 +1302,9 @@ function reportError(code, error) {
 
 const handlers = {
   async load_question(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     state.question = data;
     state.fullText = data.text || '';
     if (elements.title) {
@@ -1043,69 +1327,134 @@ const handlers = {
   },
 
   async start(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
+    const expectedSeq = state.activeSeq;
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     await setPage(fromPage, { flushAudio: true });
-    requestAudioForUpcoming();
-    typewriter.start(0);
+    await waitForUserReady();
+    if (expectedSeq !== state.activeSeq) {
+      return;
+    }
+    const page = currentPage();
+    if (!page) {
+      return;
+    }
+    state.phraseIndex = 0;
+    state.typedLength = 0;
+    setDisplayedText(page, 0);
+    updateScroll(page);
+    setStatusHint('進行中');
+    await runPresentationFlow(0);
   },
 
   stop_all() {
+    cancelFlowController('stopped');
+    audioManager.flush();
+    rejectPendingTts('stopped');
     typewriter.stop(true);
-    resetTtsPrefetch({ flushAudio: true });
     setStatusHint('停止中');
+    scheduleStatus();
   },
 
-  resume() {
-    requestAudioForUpcoming();
-    typewriter.resume();
+  async resume(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
+    const expectedSeq = state.activeSeq;
+    await waitForUserReady();
+    if (expectedSeq !== state.activeSeq) {
+      return;
+    }
+    const page = currentPage();
+    if (!page) {
+      return;
+    }
+    const index = Math.max(0, Math.min(state.phraseIndex, page.phrases.length));
+    const phrase = page.phrases[index];
+    const startLength = phrase ? computeSentenceStart(page, phrase) : page.graphemes.length;
+    state.typedLength = Math.max(state.typedLength, startLength);
+    setDisplayedText(page, state.typedLength);
+    updateScroll(page);
+    setStatusHint('再開');
+    await runPresentationFlow(index);
   },
 
   async goto_page(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     const index = Number.isInteger(data.page) ? data.page : 0;
     await setPage(index, { flushAudio: true });
     setStatusHint(`ページ ${state.pageIndex + 1}`);
   },
 
   set_cps(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     if (typeof data.value === 'number') {
       state.cps = data.value;
       updateSettingsHint();
-      resetTtsPrefetch({ flushAudio: true });
-      requestAudioForUpcoming();
+      scheduleStatus();
     }
   },
 
   set_pause_factor(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     if (typeof data.value === 'number') {
       state.pauseFactor = data.value;
       updateSettingsHint();
-      resetTtsPrefetch({ flushAudio: true });
-      requestAudioForUpcoming();
+      scheduleStatus();
     }
   },
 
   set_zoom(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     if (typeof data.value === 'number') {
       applyZoom(data.value);
     }
   },
 
   set_compact(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     setCompact(Boolean(data.value));
   },
 
-  reveal_answer() {
+  reveal_answer(data = {}) {
+    if (!ensureSequence(data)) {
+      return;
+    }
     document.body.classList.add('show-answer');
   },
 
-  play_chunk(data = {}) {
-    if (!data.wavBase64) return;
-    const id = data.id || `chunk-${Date.now()}`;
-    audioManager.enqueue(id, data.wavBase64);
-  },
-
-  flush_audio() {
-    resetTtsPrefetch({ flushAudio: true });
+  tts_result(data = {}) {
+    const ok = ensureSequence(data);
+    const requestId = data && data.requestId;
+    if (!requestId) {
+      return;
+    }
+    const resultSeq = Number.isInteger(data.seq) ? data.seq : Number.parseInt(data.seq, 10);
+    settleTtsPromise(requestId, ({ resolve, reject, seq: expectedSeq }) => {
+      if (!ok) {
+        reject(new Error('stale'));
+        return;
+      }
+      if (Number.isFinite(resultSeq) && typeof expectedSeq === 'number' && resultSeq !== expectedSeq) {
+        if (resultSeq < expectedSeq) {
+          reject(new Error('stale'));
+          return;
+        }
+      }
+      resolve(Array.isArray(data.chunks) ? data.chunks : []);
+    });
   },
 };
 
@@ -1128,6 +1477,7 @@ window.appBridge = {
 
 setBridgeReceiver(window.appBridge.receive);
 ensureBridge();
+setupUserReadyListeners();
 
 function notifyReady() {
   if (readyNotified) return;
