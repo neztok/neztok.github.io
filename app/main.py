@@ -544,6 +544,7 @@ class PresenterProcess:
         self.debug = debug
         self.on_event = on_event
         self.port = port or find_free_port()
+        self.asset_version = str(int(time.time()))
         self.process: Optional[subprocess.Popen] = None
         self.bridge: Optional[BridgeClientBase] = None
         self._stopping = False
@@ -553,6 +554,7 @@ class PresenterProcess:
         script_path = Path(__file__).with_name("presenter.py")
         self._stopping = False
         env = os.environ.copy()
+        env["PRESENTATION_INDEX_VERSION"] = self.asset_version
         args = [sys.executable, str(script_path), "--bridge", self.mode, "--port", str(self.port)]
         if self.debug:
             args.append("--debug")
@@ -754,6 +756,11 @@ class QuizApp:
             self.presentation_ready = False
             self.voicevox_var.set("未確認")
             self.voicevox_alerted = False
+        elif event == "PRESENTATION_DISCONNECTED":
+            self.bridge_var.set("未接続")
+            self.presentation_ready = False
+            self.voicevox_var.set("未確認")
+            self.voicevox_alerted = False
         elif event == "PRESENTER_EXITED":
             self.bridge_var.set("停止")
             self.presentation_ready = False
@@ -770,6 +777,8 @@ class QuizApp:
             return
         self.presentation_ready = True
         self.bridge_var.set("接続中")
+        self._debug("sending presentation init handshake")
+        self.presenter.send("presentation_init", {"type": "PRESENTATION_INIT"})
         available = self.tts_manager.check_service()
         if available:
             self.voicevox_var.set("起動中")
@@ -827,7 +836,6 @@ class QuizApp:
     def create_question_payload(self, question: QuizQuestion) -> Dict:
         return {
             "id": question.identifier,
-            "title": question.title,
             "text": question.display_text,
             "answers": question.answers,
             "explain": question.explain,

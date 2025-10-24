@@ -40,6 +40,38 @@ body {
   transition: transform var(--transition-fast) ease;
 }
 
+.connection-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  padding: 4px 10px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+  border-radius: 999px;
+  background: rgba(118, 156, 191, 0.15);
+  color: var(--text-color);
+  border: 1px solid rgba(118, 156, 191, 0.4);
+  pointer-events: none;
+  transition: background var(--transition-fast) ease, color var(--transition-fast) ease, border var(--transition-fast) ease;
+}
+
+.connection-badge[data-stage="disconnected"] {
+  background: rgba(191, 118, 118, 0.2);
+  border-color: rgba(191, 118, 118, 0.45);
+  color: var(--text-color);
+}
+
+.connection-badge[data-stage="connected"] {
+  background: rgba(118, 156, 191, 0.25);
+  border-color: rgba(118, 156, 191, 0.55);
+}
+
+.connection-badge[data-stage="ready"] {
+  background: rgba(37, 39, 31, 0.85);
+  border-color: rgba(118, 156, 191, 0.6);
+  color: #ffffff;
+}
+
 #titleBar {
   display: flex;
   justify-content: space-between;

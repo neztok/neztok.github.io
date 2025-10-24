@@ -19,6 +19,7 @@ const state = {
   currentAudioId: null,
   autoScroll: false,
   statusHint: '',
+  connectionStage: 'disconnected',
 };
 
 const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
@@ -26,6 +27,24 @@ const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 let elements = {};
 let statusFrameToken = null;
 let readyNotified = false;
+
+const CONNECTION_LABELS = {
+  disconnected: '未接続',
+  connected: '接続済み',
+  ready: '準備OK',
+};
+
+function updateConnectionBadge() {
+  if (!elements.connection) return;
+  const stage = state.connectionStage;
+  elements.connection.dataset.stage = stage;
+  elements.connection.textContent = CONNECTION_LABELS[stage] || stage;
+}
+
+function setConnectionStage(stage) {
+  state.connectionStage = stage;
+  updateConnectionBadge();
+}
 
 const params = new URLSearchParams(window.location.search || '');
 const bridgeMode = (params.get('mode') || 'ws').toLowerCase();
@@ -81,11 +100,13 @@ function createWebSocketBridge(url) {
       if (manualClose) {
         return;
       }
+      console.log('WS connect:', url);
       socket = new WebSocket(url);
       socket.onopen = () => {
         const pending = queue.splice(0);
         pending.forEach((msg) => socket.send(msg));
         console.info(`bridge socket open url=${url}`);
+        setConnectionStage('connected');
         notifyOpen();
       };
       socket.onmessage = (event) => {
@@ -105,6 +126,7 @@ function createWebSocketBridge(url) {
         console.warn(`bridge socket closed url=${url} code=${event.code} reason=${reason}`);
         ready = false;
         readyNotified = false;
+        setConnectionStage('disconnected');
         if (!manualClose) {
           connect(500);
         }
@@ -203,6 +225,7 @@ function createHttpBridge(baseUrl) {
       }
       source = new EventSource(`${baseUrl}/api/presentation/events`, { withCredentials: false });
       source.onopen = () => {
+        setConnectionStage('connected');
         notifyOpen();
       };
       source.onmessage = (event) => {
@@ -215,6 +238,7 @@ function createHttpBridge(baseUrl) {
           // ignore
         }
         readyNotified = false;
+        setConnectionStage('disconnected');
         if (!manualClose) {
           connect(1000);
         }
@@ -281,6 +305,7 @@ function ensureBridge() {
       }
     });
     bridgeConnection.onOpen(() => {
+      setConnectionStage('connected');
       notifyReady();
     });
   }
@@ -299,6 +324,7 @@ function closeBridgeConnection() {
   bridgeReceiver = null;
   pendingBridgeMessages = [];
   readyNotified = false;
+  setConnectionStage('disconnected');
 }
 
 function setBridgeReceiver(handler) {
@@ -867,6 +893,14 @@ const handlers = {
     scheduleStatus();
   },
 
+  presentation_init() {
+    setConnectionStage('ready');
+    if (!state.question) {
+      setStatusHint('待機中');
+      scheduleStatus();
+    }
+  },
+
   async start(data = {}) {
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     await setPage(fromPage, { flushAudio: true });
@@ -971,10 +1005,12 @@ document.addEventListener('DOMContentLoaded', () => {
     status: document.getElementById('statusHint'),
     answers: document.getElementById('answers'),
     explain: document.getElementById('explain'),
+    connection: document.getElementById('connectionBadge'),
   };
   applyZoom(state.zoom);
   setCompact(state.compact);
   updateSettingsHint();
+  updateConnectionBadge();
   scheduleStatus();
 });
 
