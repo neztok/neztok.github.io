@@ -1,7 +1,6 @@
 import argparse
 import asyncio
 import contextlib
-import html
 import json
 import logging
 import os
@@ -9,7 +8,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional
 
 import webview
 
@@ -194,6 +193,8 @@ class WebSocketBridgeServer(BridgeServerBase):
             raise
         finally:
             self.presentation_conn = None
+            if not self.stop_event.is_set():
+                self.send_to_control({"action": "PRESENTATION_DISCONNECTED", "data": {}})
 
     async def _flush_pending(self, pending: List[str], websocket) -> None:
         while pending:
@@ -311,8 +312,16 @@ class HttpBridgeServer(BridgeServerBase):
         async def sse_control(request: web.Request) -> web.StreamResponse:
             return await self._sse_endpoint(request, self.control_clients, self.pending_to_control)
 
+        async def notify_presentation_disconnect() -> None:
+            await self._broadcast_to_control(json.dumps({"action": "PRESENTATION_DISCONNECTED", "data": {}}))
+
         async def sse_presentation(request: web.Request) -> web.StreamResponse:
-            return await self._sse_endpoint(request, self.presentation_clients, self.pending_to_presentation)
+            return await self._sse_endpoint(
+                request,
+                self.presentation_clients,
+                self.pending_to_presentation,
+                on_disconnect=notify_presentation_disconnect,
+            )
 
         self.app.router.add_post("/api/cmd", post_cmd)
         self.app.router.add_post("/api/presentation", post_presentation)
@@ -333,7 +342,14 @@ class HttpBridgeServer(BridgeServerBase):
         for queue in queues:
             await queue.put(message)
 
-    async def _sse_endpoint(self, request, queues: List[asyncio.Queue], pending: List[str]):
+    async def _sse_endpoint(
+        self,
+        request,
+        queues: List[asyncio.Queue],
+        pending: List[str],
+        *,
+        on_disconnect: Optional[Callable[[], Awaitable[None]]] = None,
+    ):
         from aiohttp import web
 
         headers = {
@@ -365,6 +381,8 @@ class HttpBridgeServer(BridgeServerBase):
                 await response.write_eof()
             except ConnectionResetError:
                 pass
+            if on_disconnect and not self.stop_event.is_set() and not queues:
+                await on_disconnect()
         return response
 
     def start(self) -> None:
@@ -453,44 +471,42 @@ class PresenterApp:
             "height": 900,
             "resizable": True,
             "confirm_close": True,
+            "allow_local_files_access": True,
         }
 
         if not index_exists:
-            logging.error("Presentation HTML not found at %s", resolved_index)
-            escaped_path = html.escape(str(resolved_index))
-            error_html = (
-                "<!doctype html>\n"
-                "<html lang=\"ja\">\n"
-                "  <head><meta charset=\"utf-8\"><title>Presentation Error</title></head>\n"
-                "  <body style=\"font-family: sans-serif; background:#111; color:#f5f5f5; padding:24px;\">\n"
-                "    <h1>web/index.html が見つかりません</h1>\n"
-                "    <p>プレゼンテーション画面の HTML を <code>web/index.html</code> から読み込めませんでした。</p>\n"
-                "    <p>探したパス:</p>\n"
-                f"    <pre style=\"background:#222; padding:12px; border-radius:8px;\">{escaped_path}</pre>\n"
-                "    <p>プロジェクトの <code>web</code> ディレクトリが正しい場所にあるか確認してください。</p>\n"
-                "  </body>\n"
-                "</html>"
-            )
-            self.window = webview.create_window(
-                "Quiz Presentation",
-                html=error_html,
-                **window_kwargs,
-            )
+            self.server.stop()
+            raise FileNotFoundError(f"Presentation HTML not found at {resolved_index}")
+
+        version_token = os.environ.get("PRESENTATION_INDEX_VERSION") or str(int(time.time()))
+        query_params = [
+            f"mode={self.bridge_mode}",
+            f"port={self.port}",
+            f"v={version_token}",
+        ]
+        index_uri = resolved_index.as_uri() + "?" + "&".join(query_params)
+        if self.debug:
+            logging.debug("index.html URI: %s", index_uri)
+
+        file_uri = index_uri.split("?", 1)[0]
+        if file_uri.startswith("file:///"):
+            path_fragment = file_uri[8:]
+            if os.name != "nt" and not path_fragment.startswith("/"):
+                path_fragment = "/" + path_fragment
+            index_file_path = Path(path_fragment)
         else:
-            version_token = os.environ.get("PRESENTATION_INDEX_VERSION") or str(int(time.time()))
-            query_params = [
-                f"mode={self.bridge_mode}",
-                f"port={self.port}",
-                f"v={version_token}",
-            ]
-            index_uri = resolved_index.as_uri() + "?" + "&".join(query_params)
-            if self.debug:
-                logging.debug("index.html URI: %s", index_uri)
-            self.window = webview.create_window(
-                "Quiz Presentation",
-                url=index_uri,
-                **window_kwargs,
-            )
+            index_file_path = resolved_index
+
+        if not index_file_path.exists():
+            self.server.stop()
+            raise FileNotFoundError(f"Presentation HTML not found at {index_file_path}")
+
+        logging.info("Loading presentation HTML: %s", index_uri)
+        self.window = webview.create_window(
+            "Quiz Presentation",
+            url=index_uri,
+            **window_kwargs,
+        )
 
         def on_closed() -> None:
             logging.info("Presentation window closed.")
@@ -500,6 +516,7 @@ class PresenterApp:
         self.window.events.closed += on_closed
 
         def on_loaded() -> None:
+            logging.info("Presentation HTML load requested (check DevTools if blank)")
             self.server.send_to_control({"action": "READY", "data": {}})
 
         self.window.events.loaded += on_loaded
