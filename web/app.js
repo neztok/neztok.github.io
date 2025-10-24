@@ -1,6 +1,147 @@
+console.log('app.js loaded', {
+  href: window.location.href,
+  base: document.baseURI,
+});
+
+// Guard against using the current document URL as a resource target. Loading the
+// presentation HTML as if it were a script, stylesheet, or media source causes
+// the browser to reload itself endlessly (and is blocked by Chromium on
+// file:/// origins). Always point to an explicit relative asset instead.
 const segmenter = typeof Intl !== 'undefined' && Intl.Segmenter
   ? new Intl.Segmenter('ja', { granularity: 'grapheme' })
   : null;
+
+function createSelfUrlBlocklist() {
+  const canonicalize = (value) => {
+    try {
+      const resolved = new URL(value, window.location.href);
+      resolved.hash = '';
+      const withoutSearch = new URL(resolved.href);
+      withoutSearch.search = '';
+      return [resolved.href, withoutSearch.href];
+    } catch (err) {
+      return [];
+    }
+  };
+
+  const blocked = new Set();
+  canonicalize(window.location.href).forEach((value) => blocked.add(value));
+  canonicalize(document.baseURI).forEach((value) => blocked.add(value));
+  return blocked;
+}
+
+const SELF_URL_BLOCKLIST = createSelfUrlBlocklist();
+
+const RESOURCE_ATTR_TAGS = {
+  src: new Set(['AUDIO', 'EMBED', 'IFRAME', 'IMG', 'INPUT', 'SCRIPT', 'SOURCE', 'TRACK', 'VIDEO']),
+  href: new Set(['LINK']),
+  data: new Set(['OBJECT']),
+};
+
+const RESOURCE_QUERY = [
+  'audio[src]',
+  'embed[src]',
+  'iframe[src]',
+  'img[src]',
+  'input[src]',
+  'link[href]',
+  'object[data]',
+  'script[src]',
+  'source[src]',
+  'track[src]',
+  'video[src]',
+].join(',');
+
+function sanitizeResourceAttribute(element, attributeName) {
+  const tagWhitelist = RESOURCE_ATTR_TAGS[attributeName];
+  if (!tagWhitelist || !tagWhitelist.has(element.tagName)) {
+    return;
+  }
+
+  const rawValue = element.getAttribute(attributeName);
+  if (!rawValue) {
+    return;
+  }
+
+  if (!rawValue.trim()) {
+    element.removeAttribute(attributeName);
+    return;
+  }
+
+  let canonical;
+  let canonicalWithoutSearch;
+  try {
+    const resolved = new URL(rawValue, document.baseURI);
+    resolved.hash = '';
+    canonical = resolved.href;
+    const withoutSearch = new URL(resolved.href);
+    withoutSearch.search = '';
+    canonicalWithoutSearch = withoutSearch.href;
+  } catch (err) {
+    return;
+  }
+
+  if (SELF_URL_BLOCKLIST.has(canonical) ||
+      (canonicalWithoutSearch && SELF_URL_BLOCKLIST.has(canonicalWithoutSearch))) {
+    console.error('[resource-guard] Blocked self-referential resource URL', {
+      tag: element.tagName,
+      attribute: attributeName,
+      value: rawValue,
+      canonical,
+    });
+    element.removeAttribute(attributeName);
+  }
+}
+
+function sanitizeResourceTree(root) {
+  if (!root) {
+    return;
+  }
+
+  if (root.nodeType === Node.DOCUMENT_FRAGMENT_NODE) {
+    Array.from(root.childNodes).forEach((child) => sanitizeResourceTree(child));
+    return;
+  }
+
+  if (root.nodeType !== Node.ELEMENT_NODE) {
+    return;
+  }
+
+  sanitizeResourceAttribute(root, 'src');
+  sanitizeResourceAttribute(root, 'href');
+  sanitizeResourceAttribute(root, 'data');
+
+  const nodes = root.querySelectorAll ? root.querySelectorAll(RESOURCE_QUERY) : [];
+  nodes.forEach((node) => {
+    sanitizeResourceAttribute(node, 'src');
+    sanitizeResourceAttribute(node, 'href');
+    sanitizeResourceAttribute(node, 'data');
+  });
+}
+
+sanitizeResourceTree(document.documentElement);
+
+const resourceObserver = new MutationObserver((records) => {
+  records.forEach((record) => {
+    if (record.type === 'attributes' && record.attributeName) {
+      sanitizeResourceAttribute(record.target, record.attributeName);
+      return;
+    }
+
+    if (record.type === 'childList') {
+      record.addedNodes.forEach((node) => {
+        sanitizeResourceTree(node);
+      });
+    }
+  });
+});
+
+resourceObserver.observe(document.documentElement, {
+  subtree: true,
+  childList: true,
+  attributes: true,
+  attributeFilter: ['src', 'href', 'data'],
+});
 
 const state = {
   question: null,

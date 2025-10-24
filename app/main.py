@@ -538,6 +538,13 @@ def find_free_port() -> int:
     return port
 
 
+def env_flag(name: str) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class PresenterProcess:
     def __init__(self, mode: str, debug: bool, on_event: Callable[[Dict], None], port: Optional[int] = None) -> None:
         self.mode = mode
@@ -613,7 +620,7 @@ class QuizApp:
         self.root = tk.Tk()
         self.root.title("Quiz Control")
         self.ui_queue: "queue.Queue[Tuple[str, Optional[Dict]]]" = queue.Queue()
-        self.debug_enabled = debug or os.environ.get("DEBUG") == "1"
+        self.debug_enabled = debug or env_flag("DEBUG")
         self.debug_until = time.time() + 30 if self.debug_enabled else 0.0
         self.presenter = PresenterProcess(bridge_mode, self.debug_enabled, self._handle_bridge_event, port=port)
         self.presenter.start()
@@ -985,8 +992,9 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv or sys.argv[1:])
-    logging.basicConfig(level=logging.DEBUG if args.debug or os.environ.get("DEBUG") == "1" else logging.INFO)
-    app = QuizApp(args.quiz, args.bridge, debug=args.debug, port=args.port)
+    debug_enabled = args.debug or env_flag("DEBUG")
+    logging.basicConfig(level=logging.DEBUG if debug_enabled else logging.INFO)
+    app = QuizApp(args.quiz, args.bridge, debug=debug_enabled, port=args.port)
     try:
         app.run()
     finally:
