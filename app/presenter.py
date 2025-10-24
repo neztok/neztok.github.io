@@ -45,6 +45,7 @@ class PresentationServer:
         self.presentation_ws: Optional[web.WebSocketResponse] = None
         self.control_clients: List[asyncio.Queue] = []
         self.presentation_clients: List[asyncio.Queue] = []
+        self.presentation_closed = False
         self._cors_headers = {
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -204,8 +205,7 @@ class PresentationServer:
         finally:
             self.presentation_ws = None
             logging.info("WebSocket client disconnected: role=presentation")
-            if not self.stop_event.is_set():
-                await self._forward_to_control_ws(json.dumps({"action": "PRESENTATION_DISCONNECTED", "data": {}}))
+            await self._handle_presentation_closed()
         return ws
 
     async def _forward_to_control_ws(self, message: str) -> None:
@@ -325,7 +325,7 @@ class PresentationServer:
 
     async def _handle_sse_presentation(self, request: web.Request) -> web.StreamResponse:
         async def notify_disconnect() -> None:
-            await self._broadcast_to_control_http(json.dumps({"action": "PRESENTATION_DISCONNECTED", "data": {}}))
+            await self._handle_presentation_closed()
 
         return await self._sse_endpoint(
             request,
@@ -333,6 +333,22 @@ class PresentationServer:
             self.pending_to_presentation,
             on_disconnect=notify_disconnect,
         )
+
+    async def _handle_presentation_closed(self) -> None:
+        if self.presentation_closed or self.stop_event.is_set():
+            return
+        self.presentation_closed = True
+        await self._send_event_to_control("PRESENTATION_DISCONNECTED", {})
+        await self._send_event_to_control("FINISHED", {})
+        if self.loop.is_running() and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self.loop.stop)
+
+    async def _send_event_to_control(self, action: str, data: Dict) -> None:
+        message = json.dumps({"action": action, "data": data})
+        if self.mode == BRIDGE_WS:
+            await self._forward_to_control_ws(message)
+        else:
+            await self._broadcast_to_control_http(message)
 
     async def _serve_index(self, request: web.Request) -> web.StreamResponse:
         return await self._serve_static(request, filename="index.html")
