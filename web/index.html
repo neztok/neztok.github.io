@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="ja" data-build="20240518T000000Z">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -42,6 +42,12 @@
         </div>
       </div>
     </div>
-    <script type="module" src="./app.js"></script>
+    <script type="module">
+      const buildId = document.documentElement.dataset.build || `${Date.now()}`;
+      const script = document.createElement('script');
+      script.type = 'module';
+      script.src = `./app.js?v=${encodeURIComponent(buildId)}`;
+      document.body.appendChild(script);
+    </script>
   </body>
 </html>
