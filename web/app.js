@@ -163,12 +163,16 @@ const state = {
 
 const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 
+const TTS_RESULT_TIMEOUT_MS = 500;
+const SILENCE_FALLBACK_DELAY_MS = 120;
+
 let elements = {};
 let statusFrameToken = null;
 let userReadyResolvers = [];
 const pendingTtsRequests = new Map();
 let flowController = null;
 let readyNotified = false;
+let playbackQueueTail = Promise.resolve();
 
 const CONNECTION_LABELS = {
   disconnected: '未接続',
@@ -203,6 +207,7 @@ function markUserReady() {
   }
   state.readyByUser = true;
   audioManager.resumeContext();
+  console.info('user_ready=true', { timestamp: Date.now() });
   const resolvers = userReadyResolvers.splice(0);
   resolvers.forEach((resolve) => {
     try {
@@ -211,7 +216,7 @@ function markUserReady() {
       console.error('user-ready resolver failed', err);
     }
   });
-  sendCommand('USER_READY', { at: Date.now() });
+  sendEvent('PRESENTER_READY', { at: Date.now() }, { seq: state.activeSeq });
 }
 
 function setupUserReadyListeners() {
@@ -226,7 +231,8 @@ function setupUserReadyListeners() {
 
 function cancelFlowController(reason = 'cancelled') {
   if (flowController) {
-    const { controller } = flowController;
+    const { controller, seq } = flowController;
+    console.info(`CANCEL page_seq=${seq}`, { reason });
     if (controller && !controller.signal.aborted) {
       try {
         controller.abort();
@@ -238,13 +244,20 @@ function cancelFlowController(reason = 'cancelled') {
   flowController = null;
   typewriter.cancel(reason);
   audioManager.stopCurrent();
+  playbackQueueTail = Promise.resolve();
 }
 
 function rejectPendingTts(reason) {
+  const cause = reason || 'cancelled';
+  if (!pendingTtsRequests.size) {
+    return;
+  }
   pendingTtsRequests.forEach((entry, key) => {
     pendingTtsRequests.delete(key);
+    const { seq, sentSeq } = entry;
+    console.info(`DROP stale callback page_seq=${seq} sent_seq=${sentSeq}`, { reason: cause });
     try {
-      entry.reject(new Error(reason || 'cancelled'));
+      entry.reject(new Error(cause));
     } catch (err) {
       console.error('reject tts failed', err);
     }
@@ -259,6 +272,7 @@ function activateSequence(seq) {
     return state.activeSeq;
   }
   if (seq > state.activeSeq) {
+    console.info(`active_page_seq set -> ${seq}`);
     state.activeSeq = seq;
     cancelFlowController('sequence-changed');
     rejectPendingTts('sequence-changed');
@@ -270,15 +284,19 @@ function activateSequence(seq) {
   return state.activeSeq;
 }
 
-function ensureSequence(data = {}) {
-  if (!data || typeof data.seq === 'undefined') {
-    return true;
+function ensureSequence(data = {}, seqFromMessage) {
+  let seq = Number.isFinite(seqFromMessage) ? seqFromMessage : undefined;
+  if (typeof seq === 'undefined' && data && typeof data.seq !== 'undefined') {
+    const parsed = Number.parseInt(data.seq, 10);
+    if (!Number.isNaN(parsed)) {
+      seq = parsed;
+    }
   }
-  const seq = Number.parseInt(data.seq, 10);
-  if (Number.isNaN(seq)) {
+  if (typeof seq === 'undefined') {
     return true;
   }
   if (seq < state.activeSeq) {
+    console.info(`DROP stale command page_seq=${seq}`, { active: state.activeSeq });
     return false;
   }
   activateSequence(seq);
@@ -556,7 +574,7 @@ function ensureBridge() {
     });
     bridgeConnection.onOpen(() => {
       setConnectionStage('connected');
-      notifyReady();
+      notifyBridgeConnected();
     });
   }
   return bridgeConnection;
@@ -591,13 +609,21 @@ function setBridgeReceiver(handler) {
   }
 }
 
-function sendCommand(action, data = {}, options = {}) {
+function sendEvent(type, payload = {}, options = {}) {
   const bridge = ensureBridge();
-  const payload = { ...(data || {}) };
-  if (options.includeSeq !== false && typeof payload.seq === 'undefined') {
-    payload.seq = state.activeSeq;
+  const message = { type };
+  const body = payload && typeof payload === 'object' ? { ...payload } : {};
+  let seqValue;
+  if (Object.prototype.hasOwnProperty.call(options, 'seq')) {
+    seqValue = options.seq;
+  } else if (options.includeSeq !== false) {
+    seqValue = state.activeSeq;
   }
-  bridge.send({ action, data: payload });
+  if (typeof seqValue === 'number' && Number.isFinite(seqValue)) {
+    message.seq = seqValue;
+  }
+  message.payload = body;
+  bridge.send(message);
 }
 
 function segmentGraphemes(text) {
@@ -748,6 +774,17 @@ async function nextFrame() {
   return new Promise((resolve) => requestAnimationFrame(() => resolve()));
 }
 
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isFlowActive(flow) {
+  if (!flow || !flow.controller) {
+    return false;
+  }
+  return !flow.controller.signal.aborted && flow.seq === state.activeSeq;
+}
+
 async function fitContent(page) {
   if (!page || !elements.content || !elements.contentShell) return;
   const previous = elements.content.textContent;
@@ -804,8 +841,8 @@ function resetPlaybackState(options = {}) {
   scheduleStatus();
 }
 
-function registerTtsPromise(requestId, seq, resolve, reject) {
-  pendingTtsRequests.set(requestId, { resolve, reject, seq });
+function registerTtsPromise(requestId, seq, sentSeq, resolve, reject) {
+  pendingTtsRequests.set(requestId, { resolve, reject, seq, sentSeq });
 }
 
 function settleTtsPromise(requestId, callback) {
@@ -821,24 +858,22 @@ function settleTtsPromise(requestId, callback) {
   }
 }
 
-function requestSentenceAudio({ seq, requestId, startChar, endChar }) {
+function requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }) {
   return new Promise((resolve, reject) => {
-    registerTtsPromise(requestId, seq, resolve, reject);
-    sendCommand(
-      'TTS_REQUEST',
-      {
-        seq,
-        requestId,
-        slice: [
-          {
-            id: requestId,
-            startChar,
-            endChar,
-          },
-        ],
-      },
-      { includeSeq: false },
-    );
+    registerTtsPromise(requestId, seq, sentSeq, resolve, reject);
+    sendEvent('TTS_REQUEST', {
+      seq,
+      sentSeq,
+      requestId,
+      slice: [
+        {
+          id: requestId,
+          startChar,
+          endChar,
+          sentSeq,
+        },
+      ],
+    }, { seq });
   });
 }
 
@@ -856,26 +891,110 @@ function computeSentenceEnd(page, phrase) {
   return Math.max(0, Math.min(phrase.end, page.graphemes.length));
 }
 
-function createTtsRequestId(seq, pageIndex, sentenceIndex) {
-  return `${seq}:${pageIndex}:${sentenceIndex}:${Date.now()}`;
+function sentencePreview(page, phrase) {
+  if (!page || !phrase) {
+    return '';
+  }
+  const slice = page.graphemes.slice(phrase.start, phrase.end).join('');
+  return slice.slice(0, 20);
 }
 
-async function playSentence(flow, page, sentenceIndex) {
+function createPlaybackQueue(flow) {
+  let queueCount = 0;
+  let tail = Promise.resolve();
+  playbackQueueTail = tail;
+
+  const update = () => {
+    audioManager.setQueueCount(queueCount);
+  };
+
+  const enqueue = (task) => {
+    queueCount += 1;
+    update();
+    tail = tail
+      .then(async () => {
+        queueCount = Math.max(0, queueCount - 1);
+        update();
+        if (!isFlowActive(flow)) {
+          return;
+        }
+        await task();
+      })
+      .catch((err) => {
+        console.error('audio queue step failed', err);
+      });
+    playbackQueueTail = tail;
+    return tail;
+  };
+
+  const drain = () => tail;
+
+  return { enqueue, drain };
+}
+
+function createTtsRequestId(seq, pageIndex, sentSeq) {
+  return `${seq}:${pageIndex}:${sentSeq}:${Date.now()}`;
+}
+
+async function resolveTtsWithTimeout(ttsPromise, { seq, sentSeq }) {
+  const started = performance.now();
+  try {
+    const outcome = await Promise.race([
+      Promise.resolve(ttsPromise).then((chunks) => ({ type: 'chunks', chunks })),
+      delay(TTS_RESULT_TIMEOUT_MS).then(() => ({ type: 'timeout' })),
+    ]);
+    if (!outcome || outcome.type === 'timeout') {
+      console.info(`tts wait timeout page_seq=${seq} sent_seq=${sentSeq}`, {
+        wait_ms: Math.round(performance.now() - started),
+      });
+      Promise.resolve(ttsPromise)
+        .then((chunks) => {
+          if (Array.isArray(chunks) && chunks.length) {
+            console.info(`DROP stale callback page_seq=${seq} sent_seq=${sentSeq}`, { reason: 'late_tts' });
+          }
+        })
+        .catch((err) => {
+          console.info(`DROP stale callback page_seq=${seq} sent_seq=${sentSeq}`, {
+            reason: 'late_tts_error',
+            error: err && err.message ? err.message : String(err),
+          });
+        });
+      return { chunks: [], timeout: true };
+    }
+    const elapsed = Math.round(performance.now() - started);
+    const chunks = Array.isArray(outcome.chunks) ? outcome.chunks : [];
+    console.info(`tts ready page_seq=${seq} sent_seq=${sentSeq}`, { wait_ms: elapsed });
+    return { chunks, timeout: false };
+  } catch (err) {
+    console.error('tts wait failed', err);
+    console.info(`DROP stale callback page_seq=${seq} sent_seq=${sentSeq}`, { reason: 'error' });
+    return { chunks: [], timeout: false };
+  }
+}
+
+async function processSentence(flow, page, sentenceIndex, playbackQueue) {
   const phrase = page.phrases[sentenceIndex];
   if (!phrase) {
     state.phraseIndex = sentenceIndex + 1;
     scheduleStatus();
     return true;
   }
-  const seq = flow.seq;
-  const signal = flow.controller.signal;
-  if (signal.aborted || seq !== state.activeSeq) {
+  if (!isFlowActive(flow)) {
     return false;
   }
-  const requestId = createTtsRequestId(seq, state.pageIndex, sentenceIndex);
+  const seq = flow.seq;
+  const sentSeq = sentenceIndex + 1;
+  console.info(`enqueue sentence sent_seq=${sentSeq}`, {
+    page_seq: seq,
+    text: sentencePreview(page, phrase),
+  });
+  const requestId = createTtsRequestId(seq, state.pageIndex, sentSeq);
   const startChar = page.start + computeSentenceStart(page, phrase);
   const endChar = page.start + computeSentenceEnd(page, phrase);
-  const ttsPromise = requestSentenceAudio({ seq, requestId, startChar, endChar }).catch(() => []);
+  const ttsPromise = requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }).catch((err) => {
+    console.error('tts request failed', err);
+    return [];
+  });
   try {
     await typewriter.revealTo(page, computeSentenceEnd(page, phrase), flow);
   } catch (err) {
@@ -884,26 +1003,40 @@ async function playSentence(flow, page, sentenceIndex) {
   state.typedLength = Math.max(state.typedLength, computeSentenceEnd(page, phrase));
   setDisplayedText(page, state.typedLength);
   updateScroll(page);
-  if (signal.aborted || seq !== state.activeSeq) {
+  if (!isFlowActive(flow)) {
     return false;
   }
-  let chunks = [];
-  try {
-    chunks = await ttsPromise;
-  } catch (err) {
-    chunks = [];
-  }
-  if (signal.aborted || seq !== state.activeSeq) {
-    return false;
-  }
-  if (Array.isArray(chunks) && chunks.length) {
-    await audioManager.playChunks(chunks, { controller: flow.controller, seq });
-  }
-  if (signal.aborted || seq !== state.activeSeq) {
-    return false;
-  }
-  state.phraseIndex = sentenceIndex + 1;
-  scheduleStatus();
+  playbackQueue.enqueue(async () => {
+    if (!isFlowActive(flow)) {
+      return;
+    }
+    const { chunks, timeout } = await resolveTtsWithTimeout(ttsPromise, { seq, sentSeq });
+    if (!isFlowActive(flow)) {
+      return;
+    }
+    if (Array.isArray(chunks) && chunks.length) {
+      const started = performance.now();
+      console.info(`play start page_seq=${seq} sent_seq=${sentSeq}`);
+      try {
+        await audioManager.playChunks(chunks, { controller: flow.controller, seq, sentSeq });
+      } finally {
+        const elapsed = Math.round(performance.now() - started);
+        console.info(`play end page_seq=${seq} sent_seq=${sentSeq}`, { dur_ms: elapsed });
+      }
+    } else if (timeout) {
+      console.info(`play skip page_seq=${seq} sent_seq=${sentSeq}`, { reason: 'timeout' });
+      if (SILENCE_FALLBACK_DELAY_MS > 0) {
+        await delay(SILENCE_FALLBACK_DELAY_MS);
+      }
+    } else {
+      console.info(`play skip page_seq=${seq} sent_seq=${sentSeq}`, { reason: 'no_audio' });
+    }
+    if (!isFlowActive(flow)) {
+      return;
+    }
+    state.phraseIndex = sentenceIndex + 1;
+    scheduleStatus();
+  });
   return true;
 }
 
@@ -922,16 +1055,18 @@ async function runPresentationFlow(startSentence = 0) {
     return;
   }
   state.phraseIndex = Math.max(0, Math.min(startSentence, page.phrases.length));
+  const playbackQueue = createPlaybackQueue(flow);
   for (let index = startSentence; index < page.phrases.length; index += 1) {
-    if (controller.signal.aborted || seq !== state.activeSeq) {
+    if (!isFlowActive(flow)) {
       return;
     }
-    const ok = await playSentence(flow, page, index);
+    const ok = await processSentence(flow, page, index, playbackQueue);
     if (!ok) {
       return;
     }
   }
-  if (!controller.signal.aborted && seq === state.activeSeq) {
+  await playbackQueue.drain();
+  if (isFlowActive(flow)) {
     setStatusHint('完了');
     scheduleStatus();
   }
@@ -952,7 +1087,7 @@ function sendStatus() {
     phraseIndex: Math.max(1, state.phraseIndex + 1),
     ttsQueue: audioManager.queueLength(),
   };
-  sendCommand('STATUS', payload);
+  sendEvent('STATUS', payload);
 }
 
 function flashOverlay() {
@@ -980,7 +1115,8 @@ const audioManager = {
   context: null,
   currentSource: null,
   playbackSeq: 0,
-  pendingCount: 0,
+  queueCount: 0,
+  chunkCount: 0,
 
   getContext() {
     if (this.context) {
@@ -1026,29 +1162,38 @@ const audioManager = {
     if (!Array.isArray(chunks) || !chunks.length) {
       return;
     }
-    const { controller, seq } = meta;
+    const { controller, seq, sentSeq } = meta;
     if (!controller || controller.signal.aborted) {
       return;
     }
     this.playbackSeq = seq;
-    this.pendingCount = chunks.length;
+    this.chunkCount = chunks.length;
     scheduleStatus();
-    for (const item of chunks) {
+    for (let index = 0; index < chunks.length; index += 1) {
+      const item = chunks[index];
       if (controller.signal.aborted || seq !== state.activeSeq) {
         break;
       }
       const base64 = typeof item === 'string' ? item : item && item.wavBase64;
       if (!base64) {
-        this.pendingCount -= 1;
+        this.chunkCount = Math.max(0, this.chunkCount - 1);
+        scheduleStatus();
         continue;
       }
       const buffer = await this.decode(base64);
       if (!buffer) {
-        this.pendingCount -= 1;
+        this.chunkCount = Math.max(0, this.chunkCount - 1);
+        scheduleStatus();
         continue;
       }
       if (controller.signal.aborted || seq !== state.activeSeq) {
         break;
+      }
+      if (typeof sentSeq === 'number') {
+        console.info(`tts play chunk start page_seq=${seq} sent_seq=${sentSeq}`, {
+          chunk: index + 1,
+          total: chunks.length,
+        });
       }
       try {
         await this.playBuffer(buffer, meta);
@@ -1056,12 +1201,12 @@ const audioManager = {
         reportError('audio_start_failed', err);
         break;
       } finally {
-        this.pendingCount -= 1;
+        this.chunkCount = Math.max(0, this.chunkCount - 1);
         scheduleStatus();
       }
     }
     this.playbackSeq = 0;
-    this.pendingCount = Math.max(0, this.pendingCount);
+    this.chunkCount = Math.max(0, this.chunkCount);
     scheduleStatus();
   },
 
@@ -1130,7 +1275,8 @@ const audioManager = {
       this.currentSource = null;
     }
     this.playbackSeq = 0;
-    this.pendingCount = 0;
+    this.chunkCount = 0;
+    this.queueCount = 0;
     scheduleStatus();
   },
 
@@ -1138,8 +1284,13 @@ const audioManager = {
     this.stopCurrent();
   },
 
+  setQueueCount(count) {
+    this.queueCount = Math.max(0, count);
+    scheduleStatus();
+  },
+
   queueLength() {
-    return (this.currentSource ? 1 : 0) + this.pendingCount;
+    return (this.currentSource ? 1 : 0) + this.queueCount + this.chunkCount;
   },
 };
 
@@ -1297,14 +1448,36 @@ async function setPage(index, options = {}) {
 function reportError(code, error) {
   console.error(code, error);
   const message = error && error.message ? error.message : String(error);
-  sendCommand('ERROR', { code, message });
+  sendEvent('ERROR', { code, message });
 }
 
 const handlers = {
-  async load_question(data = {}) {
-    if (!ensureSequence(data)) {
+  PAGE_SEQ(_data = {}, seq) {
+    if (!Number.isFinite(seq)) {
       return;
     }
+    const target = Number(seq);
+    console.info(`rx PAGE_SEQ seq=${target}`);
+    activateSequence(target);
+    sendEvent('PRESENTER_ACK', { ack: 'PAGE_SEQ' }, { seq: target });
+    setStatusHint('待機中');
+    scheduleStatus();
+  },
+
+  PRESENTATION_INIT() {
+    setConnectionStage('ready');
+    if (!state.question) {
+      setStatusHint('待機中');
+      scheduleStatus();
+    }
+  },
+
+  async PRESENT(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
+      return;
+    }
+    const pageSeq = Number.isFinite(seq) ? seq : state.activeSeq;
+    console.info(`rx PRESENT page_seq=${pageSeq}`);
     state.question = data;
     state.fullText = data.text || '';
     if (elements.title) {
@@ -1316,23 +1489,25 @@ const handlers = {
     await setPage(0, { flushAudio: true });
     setStatusHint('待機中');
     scheduleStatus();
+    const page = currentPage();
+    const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
+    console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: phrases.length });
+    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: pageSeq });
   },
 
-  presentation_init() {
-    setConnectionStage('ready');
-    if (!state.question) {
-      setStatusHint('待機中');
-      scheduleStatus();
-    }
-  },
-
-  async start(data = {}) {
-    if (!ensureSequence(data)) {
+  async START(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
+    const active = state.activeSeq;
+    console.info(`rx START page_seq=${active}`);
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     await setPage(fromPage, { flushAudio: true });
     await waitForUserReady();
+    if (active !== state.activeSeq) {
+      return;
+    }
     const page = currentPage();
     if (!page) {
       return;
@@ -1345,7 +1520,10 @@ const handlers = {
     await runPresentationFlow(0);
   },
 
-  stop_all() {
+  STOP_ALL(_data = {}, seq) {
+    if (!ensureSequence({}, seq)) {
+      return;
+    }
     cancelFlowController('stopped');
     audioManager.flush();
     rejectPendingTts('stopped');
@@ -1354,11 +1532,16 @@ const handlers = {
     scheduleStatus();
   },
 
-  async resume(data = {}) {
-    if (!ensureSequence(data)) {
+  async RESUME(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
+    const expectedSeq = state.activeSeq;
+    console.info(`rx RESUME page_seq=${expectedSeq}`);
     await waitForUserReady();
+    if (expectedSeq !== state.activeSeq) {
+      return;
+    }
     const page = currentPage();
     if (!page) {
       return;
@@ -1373,17 +1556,22 @@ const handlers = {
     await runPresentationFlow(index);
   },
 
-  async goto_page(data = {}) {
-    if (!ensureSequence(data)) {
+  async GOTO_PAGE(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     const index = Number.isInteger(data.page) ? data.page : 0;
     await setPage(index, { flushAudio: true });
     setStatusHint(`ページ ${state.pageIndex + 1}`);
+    const page = currentPage();
+    const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
+    console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: phrases.length });
+    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: state.activeSeq });
   },
 
-  set_cps(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_CPS(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     if (typeof data.value === 'number') {
@@ -1393,8 +1581,8 @@ const handlers = {
     }
   },
 
-  set_pause_factor(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_PAUSE_FACTOR(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     if (typeof data.value === 'number') {
@@ -1404,8 +1592,8 @@ const handlers = {
     }
   },
 
-  set_zoom(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_ZOOM(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     if (typeof data.value === 'number') {
@@ -1413,37 +1601,59 @@ const handlers = {
     }
   },
 
-  set_compact(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_COMPACT(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     setCompact(Boolean(data.value));
   },
 
-  reveal_answer(data = {}) {
-    if (!ensureSequence(data)) {
+  REVEAL(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
+    console.info(`rx REVEAL page_seq=${state.activeSeq}`);
     document.body.classList.add('show-answer');
   },
 
-  tts_result(data = {}) {
-    const ok = ensureSequence(data);
+  CLEAR(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
+      return;
+    }
+    clearAnswerPanel();
+  },
+
+  TTS_RESULT(data = {}, seq) {
+    const ok = ensureSequence(data, seq);
     const requestId = data && data.requestId;
     if (!requestId) {
       return;
     }
-    const resultSeq = Number.isInteger(data.seq) ? data.seq : Number.parseInt(data.seq, 10);
-    settleTtsPromise(requestId, ({ resolve, reject, seq: expectedSeq }) => {
+    const resultSeq = Number.isInteger(seq) ? seq : Number.parseInt(seq, 10);
+    const resultSentSeq = Number.isInteger(data.sentSeq) ? data.sentSeq : Number.parseInt(data.sentSeq, 10);
+    settleTtsPromise(requestId, ({ resolve, reject, seq: expectedSeq, sentSeq: expectedSentSeq }) => {
       if (!ok) {
+        console.info(`DROP stale callback page_seq=${resultSeq} sent_seq=${resultSentSeq}`, {
+          reason: 'sequence_guard',
+        });
         reject(new Error('stale'));
         return;
       }
       if (Number.isFinite(resultSeq) && typeof expectedSeq === 'number' && resultSeq !== expectedSeq) {
-        if (resultSeq < expectedSeq) {
-          reject(new Error('stale'));
-          return;
-        }
+        console.info(`DROP stale callback page_seq=${resultSeq} sent_seq=${resultSentSeq}`, {
+          reason: 'seq_mismatch',
+          expected: expectedSeq,
+        });
+        reject(new Error('stale'));
+        return;
+      }
+      if (Number.isFinite(resultSentSeq) && typeof expectedSentSeq === 'number' && resultSentSeq !== expectedSentSeq) {
+        console.info(`DROP stale callback page_seq=${resultSeq} sent_seq=${resultSentSeq}`, {
+          reason: 'sent_seq_mismatch',
+          expected: expectedSentSeq,
+        });
+        reject(new Error('stale'));
+        return;
       }
       resolve(Array.isArray(data.chunks) ? data.chunks : []);
     });
@@ -1454,12 +1664,21 @@ window.appBridge = {
   receive(message) {
     try {
       const payload = typeof message === 'string' ? JSON.parse(message) : message;
-      if (!payload || !payload.action) {
+      if (!payload) {
         return;
       }
-      const handler = handlers[payload.action];
+      const type = payload.type || payload.action;
+      if (!type) {
+        return;
+      }
+      const handler = handlers[type];
       if (handler) {
-        Promise.resolve(handler(payload.data || {})).catch((err) => reportError('handler_failed', err));
+        const seq = typeof payload.seq === 'number' ? payload.seq : Number.parseInt(payload.seq, 10);
+        const body = payload.payload && typeof payload.payload === 'object' ? { ...payload.payload } : {};
+        if (Number.isFinite(seq) && typeof body.seq === 'undefined') {
+          body.seq = seq;
+        }
+        Promise.resolve(handler(body, seq, payload)).catch((err) => reportError('handler_failed', err));
       }
     } catch (err) {
       reportError('receive_failed', err);
@@ -1471,10 +1690,10 @@ setBridgeReceiver(window.appBridge.receive);
 ensureBridge();
 setupUserReadyListeners();
 
-function notifyReady() {
+function notifyBridgeConnected() {
   if (readyNotified) return;
   readyNotified = true;
-  sendCommand('READY', {});
+  sendEvent('PRESENTER_CONNECTED', {});
 }
 
 document.addEventListener('DOMContentLoaded', () => {
