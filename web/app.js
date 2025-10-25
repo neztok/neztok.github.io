@@ -2141,6 +2141,7 @@ async function runPresentationFlow(startSentence = 0) {
   }
   state.phraseIndex = Math.max(0, Math.min(startSentence, page.phrases.length));
   const playbackQueue = createPlaybackQueue(flow);
+  prefetchSentences(seq, page, state.phraseIndex);
   for (let index = startSentence; index < page.phrases.length; index += 1) {
     if (!isFlowActive(flow)) {
       return;
