@@ -23,7 +23,7 @@ import requests
 
 VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER = 1
-MAX_CHARS_PER_TTS = 30
+MAX_CHARS_PER_TTS = 150
 BRIDGE_WS = "ws"
 BRIDGE_HTTP = "http"
 
@@ -638,6 +638,7 @@ class QuizApp:
         self.page_seq = 0
         self.active_page_seq = 0
         self.pending_tts_jobs: Dict[int, int] = defaultdict(int)
+        self.sequence_sentences: Dict[int, List[Tuple[int, int]]] = {}
         self.pending_sequence_commands: Dict[int, List[Tuple[str, Dict]]] = {}
         self.awaiting_sentences: Set[int] = set()
         self.ready_sequences: Set[int] = set()
@@ -717,6 +718,9 @@ class QuizApp:
                     count = self.pending_tts_jobs.pop(seq, 0)
                     if count:
                         logging.info("cancel all for page_seq=<%d> count=%d", seq, count)
+        for seq in list(self.sequence_sentences.keys()):
+            if seq < new_seq:
+                self.sequence_sentences.pop(seq, None)
         for seq in list(self.pending_sequence_commands.keys()):
             if seq < new_seq:
                 self.pending_sequence_commands.pop(seq, None)
@@ -928,7 +932,33 @@ class QuizApp:
         if seq is None:
             return
         count = payload.get("count") if isinstance(payload, dict) else None
-        logging.info("rx SENTENCES_READY seq=%d count=%s", seq, count)
+        lengths: List[int] = []
+        sentences = payload.get("sentences") if isinstance(payload, dict) else None
+        if isinstance(sentences, list):
+            spans: List[Tuple[int, int]] = []
+            for entry in sentences:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    start = int(entry.get("start"))
+                    end = int(entry.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if end <= start:
+                    continue
+                spans.append((start, end))
+                length = end - start
+                lengths.append(length)
+            if spans:
+                self.sequence_sentences[seq] = spans
+            elif seq in self.sequence_sentences:
+                self.sequence_sentences.pop(seq, None)
+        logging.info(
+            "rx SENTENCES_READY seq=%d count=%s lengths=%s",
+            seq,
+            count,
+            lengths if lengths else "-",
+        )
         self.awaiting_sentences.discard(seq)
         self.ready_sequences.add(seq)
         if seq in self.pending_start_requests:
@@ -938,25 +968,17 @@ class QuizApp:
 
     def handle_tts_request(self, payload: Dict) -> None:
         request_id = payload.get("requestId")
-        slices = payload.get("slice")
-        if not request_id or not isinstance(slices, list) or not self.current_question:
+        if not request_id or not self.current_question:
             return
         try:
             seq = int(payload.get("seq", self.page_seq))
         except (TypeError, ValueError):
             seq = self.page_seq
-        sent_seq: Optional[int] = None
+        sent_seq: Optional[int]
         try:
             sent_seq = int(payload.get("sentSeq"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            pass
-        if sent_seq is None:
-            for item in slices:
-                try:
-                    sent_seq = int(item.get("sentSeq"))  # type: ignore[arg-type]
-                    break
-                except (TypeError, ValueError):
-                    continue
+            sent_seq = None
         if seq < self.active_page_seq:
             logging.info(
                 "drop stale job page_seq=%d sent_seq=%s (expected >=%d)",
@@ -965,7 +987,35 @@ class QuizApp:
                 self.active_page_seq,
             )
             return
+        spans = self.sequence_sentences.get(seq)
+        start: Optional[int] = None
+        end: Optional[int] = None
+        if spans and sent_seq and 1 <= sent_seq <= len(spans):
+            start, end = spans[sent_seq - 1]
+        if (start is None or end is None) and isinstance(payload.get("startChar"), (int, str)):
+            try:
+                start = int(payload.get("startChar"))
+                end = int(payload.get("endChar"))
+            except (TypeError, ValueError):
+                start = end = None
+        if start is None or end is None or end <= start:
+            logging.info(
+                "skip TTS page_seq=%d sent_seq=%s reason=no_range", seq, sent_seq
+            )
+            response = {"requestId": request_id, "chunks": []}
+            if sent_seq is not None:
+                response["sentSeq"] = sent_seq
+            self.presenter.send("TTS_RESULT", response, seq=seq)
+            return
+
         question = self.current_question
+        total_length = len(question.display_text)
+        if start is None or end is None:
+            return
+        start = max(0, min(total_length, start))
+        end = max(start, min(total_length, end))
+        text_length = max(0, end - start)
+        mode = payload.get("mode") or "playback"
 
         with self.pending_tts_lock:
             self.pending_tts_jobs[seq] += 1
@@ -973,25 +1023,35 @@ class QuizApp:
         def worker() -> None:
             started = time.perf_counter()
             chunks: List[str] = []
-            logging.info("tts gen start page_seq=%d sent_seq=%s", seq, sent_seq)
+            logging.info(
+                "tts gen start page_seq=%d sent_seq=%s mode=%s len=%d",
+                seq,
+                sent_seq,
+                mode,
+                text_length,
+            )
             try:
-                for item in slices:
-                    start = int(item.get("startChar", 0))
-                    end = int(item.get("endChar", 0))
-                    segments = question.get_tts_segments(start, end)
-                    texts = []
-                    for text, is_kana in segments:
-                        if len(text) > MAX_CHARS_PER_TTS:
-                            for idx in range(0, len(text), MAX_CHARS_PER_TTS):
-                                texts.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
-                        else:
-                            texts.append((text, is_kana))
-                    for text, is_kana in texts:
-                        wav = self.tts_manager.synthesize(text, is_kana=is_kana)
-                        if wav:
-                            chunks.append(wav)
+                segments = question.get_tts_segments(start, end)
+                texts: List[Tuple[str, bool]] = []
+                for text, is_kana in segments:
+                    if len(text) > MAX_CHARS_PER_TTS:
+                        for idx in range(0, len(text), MAX_CHARS_PER_TTS):
+                            texts.append((text[idx : idx + MAX_CHARS_PER_TTS], is_kana))
+                    else:
+                        texts.append((text, is_kana))
+                for text, is_kana in texts:
+                    wav = self.tts_manager.synthesize(text, is_kana=is_kana)
+                    if wav:
+                        chunks.append(wav)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
-                logging.info("tts gen end page_seq=%d sent_seq=%s ms=%d", seq, sent_seq, elapsed_ms)
+                logging.info(
+                    "tts gen end page_seq=%d sent_seq=%s mode=%s ms=%d chunks=%d",
+                    seq,
+                    sent_seq,
+                    mode,
+                    elapsed_ms,
+                    len(chunks),
+                )
                 if seq < self.active_page_seq:
                     logging.info(
                         "drop stale job page_seq=%d sent_seq=%s (expected >=%d)",
