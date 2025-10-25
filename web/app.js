@@ -395,22 +395,22 @@ function currentPreloadSeq() {
   return state.preload && state.preload.seq ? state.preload.seq : state.activeSeq;
 }
 
-function notifyPreloadStatus(overrides = {}) {
-  const info = state.preload || {};
+function notifyPreloadStatus(info = state.preload, overrides = {}) {
+  const target = info || {};
   const payload = {
-    status: info.status || 'idle',
-    total: info.total || 0,
-    completed: info.completed || 0,
-    failed: info.failed || 0,
-    active: info.active || 0,
-    percent: computePreloadPercent(info),
-    currentSentSeq: info.currentSentSeq || 0,
-    preview: info.currentPreview || '',
-    message: info.message || '',
-    allowForce: Boolean(info.allowForce),
-    elapsedMs: info.startedAt ? Math.round(performance.now() - info.startedAt) : 0,
-    seq: currentPreloadSeq(),
-    reasons: info.failReasons || {},
+    status: target.status || 'idle',
+    total: target.total || 0,
+    completed: target.completed || 0,
+    failed: target.failed || 0,
+    active: target.active || 0,
+    percent: computePreloadPercent(target),
+    currentSentSeq: target.currentSentSeq || 0,
+    preview: target.currentPreview || '',
+    message: target.message || '',
+    allowForce: Boolean(target.allowForce),
+    elapsedMs: target.startedAt ? Math.round(performance.now() - target.startedAt) : 0,
+    seq: Number.isFinite(target.seq) ? target.seq : currentPreloadSeq(),
+    reasons: target.failReasons || {},
     ...overrides,
   };
   console.info(`preload status page_seq=${payload.seq}`, payload);
@@ -768,7 +768,7 @@ async function startPreloading(seq, page) {
   cancelPreloading('restart');
   if (!page || !Array.isArray(page.phrases)) {
     resetPreloadState({ status: 'done', seq });
-    notifyPreloadStatus();
+    notifyPreloadStatus(state.preload);
     return;
   }
   const phrases = page.phrases.filter((phrase) => phrase && (phrase.length || (phrase.end - phrase.start) > 0));
@@ -799,11 +799,11 @@ async function startPreloading(seq, page) {
   });
   recomputePreloadAggregates(info);
   updatePreloadUI();
-  notifyPreloadStatus();
+  notifyPreloadStatus(info);
   if (!total) {
     finalizePreloadState(info);
     updatePreloadUI();
-    notifyPreloadStatus();
+    notifyPreloadStatus(info);
     return;
   }
   console.info(`preload start page_seq=${seq}`, { total, concurrency: PRELOAD_CONCURRENCY });
@@ -832,7 +832,7 @@ async function startPreloading(seq, page) {
     info.currentSentSeq = sentSeq;
     info.currentPreview = preview;
     updatePreloadUI();
-    notifyPreloadStatus();
+    notifyPreloadStatus(info);
     const length = Number.isFinite(phrase.length)
       ? phrase.length
       : Math.max(0, (phrase.end || 0) - (phrase.start || 0));
@@ -848,13 +848,13 @@ async function startPreloading(seq, page) {
       const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch', refresh });
       const waitMs = beginPreloadAttempt(info, sentSeq, entry.requestId, attempt, length);
       updatePreloadUI();
-      notifyPreloadStatus();
+      notifyPreloadStatus(info);
       const started = performance.now();
       const outcome = await raceWithTimeout(entry.promise, waitMs, controller.signal);
       if (outcome.type === 'aborted') {
         markPreloadRetry(info, sentSeq);
         updatePreloadUI();
-        notifyPreloadStatus();
+        notifyPreloadStatus(info);
         return;
       }
       let timedOut = false;
@@ -871,7 +871,7 @@ async function startPreloading(seq, page) {
           attempt,
         });
         updatePreloadUI();
-        notifyPreloadStatus();
+        notifyPreloadStatus(info);
         try {
           chunks = await entry.promise;
         } catch (err) {
@@ -881,7 +881,7 @@ async function startPreloading(seq, page) {
       if (controller.signal.aborted) {
         markPreloadRetry(info, sentSeq);
         updatePreloadUI();
-        notifyPreloadStatus();
+        notifyPreloadStatus(info);
         return;
       }
       const chunkList = Array.isArray(chunks) ? chunks : [];
@@ -909,12 +909,12 @@ async function startPreloading(seq, page) {
         console.warn(`preload failed page_seq=${seq} sent_seq=${sentSeq}`, { reason: lastReason || 'unknown' });
       }
       updatePreloadUI();
-      notifyPreloadStatus();
+      notifyPreloadStatus(info);
     }
     info.currentSentSeq = 0;
     info.currentPreview = '';
     updatePreloadUI();
-    notifyPreloadStatus();
+    notifyPreloadStatus(info);
   };
 
   const workers = Array.from({ length: Math.min(PRELOAD_CONCURRENCY, total) }, async () => {
@@ -934,12 +934,12 @@ async function startPreloading(seq, page) {
         info.status = 'cancelled';
         info.message = '';
         updatePreloadUI();
-        notifyPreloadStatus({ status: 'cancelled' });
+        notifyPreloadStatus(info, { status: 'cancelled' });
         return;
       }
       finalizePreloadState(info);
       updatePreloadUI();
-      notifyPreloadStatus();
+      notifyPreloadStatus(info);
     })
     .catch((err) => {
       console.warn('preload worker failed', err);
@@ -961,7 +961,7 @@ async function startPreloading(seq, page) {
           info.message = '通常より時間がかかっています';
         }
         updatePreloadUI();
-        notifyPreloadStatus();
+        notifyPreloadStatus(info);
       }
     }
   })();
@@ -2414,7 +2414,7 @@ const handlers = {
         state.preload.message = '';
         state.preload.allowForce = false;
         updatePreloadUI();
-        notifyPreloadStatus({ status: 'forced' });
+        notifyPreloadStatus(state.preload, { status: 'forced' });
       }
     } else {
       await waitForPreloadCompletion();
