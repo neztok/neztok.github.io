@@ -943,6 +943,19 @@ class QuizApp:
         allow_force = bool(payload.get("allowForce"))
         elapsed_ms = payload.get("elapsedMs")
         current_sent_seq = payload.get("currentSentSeq")
+        reasons_raw = payload.get("reasons")
+        reasons: Dict[str, int] = {}
+        if isinstance(reasons_raw, dict):
+            for key, value in reasons_raw.items():
+                try:
+                    count = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if count <= 0:
+                    continue
+                reasons[str(key)] = count
+        reason_parts = [f"{count}文:{label}" for label, count in reasons.items()]
+        reason_summary = " / ".join(reason_parts)
 
         self.preload_state.update(
             {
@@ -953,6 +966,7 @@ class QuizApp:
                 "failed": failed,
                 "elapsed": elapsed_ms,
                 "allowForce": allow_force,
+                "reasons": reasons,
             }
         )
 
@@ -982,7 +996,10 @@ class QuizApp:
             self._set_start_enabled(False)
             self._set_force_start_enabled(True)
             if not display_message:
-                display_message = f"{failed}文失敗（無音再生）" if failed else "音声生成に失敗しました"
+                if reason_summary:
+                    display_message = f"一部失敗（{reason_summary}）"
+                else:
+                    display_message = f"{failed}文失敗（無音再生）" if failed else "音声生成に失敗しました"
             self._maybe_dispatch_pending_start(seq)
         elif status == "forced":
             self._set_start_enabled(False)

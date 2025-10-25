@@ -173,6 +173,8 @@ const state = {
     promise: null,
     slowWarning: false,
     allowForce: false,
+    jobs: new Map(),
+    failReasons: {},
   },
 };
 
@@ -181,7 +183,10 @@ const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 const TTS_RESULT_TIMEOUT_MS = 500;
 const SILENCE_FALLBACK_DELAY_MS = 120;
 const AUDIO_SYNC_WAIT_MS = 500;
-const PRELOAD_TIMEOUT_MS = 5000;
+const PRELOAD_TIMEOUT_BASE_MS = 1500;
+const PRELOAD_TIMEOUT_PER_CHAR_MS = 25;
+const PRELOAD_TIMEOUT_MIN_MS = 3000;
+const PRELOAD_TIMEOUT_MAX_MS = 15000;
 const PRELOAD_MAX_RETRIES = 1;
 const PRELOAD_CONCURRENCY = 3;
 const PRELOAD_GLOBAL_FACTOR = 0.6;
@@ -359,6 +364,8 @@ function resetPreloadState(overrides = {}) {
     promise: null,
     slowWarning: false,
     allowForce: false,
+    jobs: new Map(),
+    failReasons: {},
     ...overrides,
   };
   updatePreloadUI();
@@ -388,21 +395,22 @@ function currentPreloadSeq() {
   return state.preload && state.preload.seq ? state.preload.seq : state.activeSeq;
 }
 
-function notifyPreloadStatus(overrides = {}) {
-  const info = state.preload || {};
+function notifyPreloadStatus(info = state.preload, overrides = {}) {
+  const target = info || {};
   const payload = {
-    status: info.status || 'idle',
-    total: info.total || 0,
-    completed: info.completed || 0,
-    failed: info.failed || 0,
-    active: info.active || 0,
-    percent: computePreloadPercent(info),
-    currentSentSeq: info.currentSentSeq || 0,
-    preview: info.currentPreview || '',
-    message: info.message || '',
-    allowForce: Boolean(info.allowForce),
-    elapsedMs: info.startedAt ? Math.round(performance.now() - info.startedAt) : 0,
-    seq: currentPreloadSeq(),
+    status: target.status || 'idle',
+    total: target.total || 0,
+    completed: target.completed || 0,
+    failed: target.failed || 0,
+    active: target.active || 0,
+    percent: computePreloadPercent(target),
+    currentSentSeq: target.currentSentSeq || 0,
+    preview: target.currentPreview || '',
+    message: target.message || '',
+    allowForce: Boolean(target.allowForce),
+    elapsedMs: target.startedAt ? Math.round(performance.now() - target.startedAt) : 0,
+    seq: Number.isFinite(target.seq) ? target.seq : currentPreloadSeq(),
+    reasons: target.failReasons || {},
     ...overrides,
   };
   console.info(`preload status page_seq=${payload.seq}`, payload);
@@ -439,7 +447,7 @@ function updatePreloadUI() {
     elements.preloadMessage.textContent = info.message || '';
   }
   if (elements.preloadForceButton) {
-    const showForce = info.status === 'failed' && info.failed > 0;
+    const showForce = Boolean(info.allowForce && info.failed > 0);
     elements.preloadForceButton.classList.toggle('hidden', !showForce);
     elements.preloadForceButton.disabled = !showForce;
   }
@@ -463,14 +471,153 @@ async function waitForPreloadCompletion({ force = false } = {}) {
   }
 }
 
-function markPreloadFailure(info, sentSeq, reason) {
-  info.failed += 1;
-  info.message = `${info.failed}文失敗（無音再生）`;
-  info.allowForce = true;
-  console.warn(`preload failed page_seq=${info.seq} sent_seq=${sentSeq}`, { reason });
+function computePreloadDeadline(length) {
+  const len = Number.isFinite(length) ? length : 0;
+  const estimate = PRELOAD_TIMEOUT_BASE_MS + len * PRELOAD_TIMEOUT_PER_CHAR_MS;
+  const clamped = Math.max(PRELOAD_TIMEOUT_MIN_MS, Math.min(PRELOAD_TIMEOUT_MAX_MS, estimate));
+  return clamped;
 }
 
-function markPreloadSuccess(info) {
+function ensurePreloadJobs(info) {
+  if (!info) {
+    return new Map();
+  }
+  if (!(info.jobs instanceof Map)) {
+    info.jobs = new Map();
+  }
+  return info.jobs;
+}
+
+function ensurePreloadJob(info, sentSeq, defaults = {}) {
+  if (!info || typeof sentSeq === 'undefined') {
+    return null;
+  }
+  const jobs = ensurePreloadJobs(info);
+  const key = Number.parseInt(sentSeq, 10);
+  if (!jobs.has(key)) {
+    jobs.set(key, {
+      status: 'pending',
+      requestId: null,
+      attempts: 0,
+      reason: '',
+      length: Number.isFinite(defaults.length) ? defaults.length : 0,
+      startedAt: 0,
+      deadline: 0,
+      delayed: false,
+      lastMeta: {},
+    });
+  } else if (defaults && Number.isFinite(defaults.length)) {
+    const job = jobs.get(key);
+    if (job && (!Number.isFinite(job.length) || job.length <= 0)) {
+      job.length = defaults.length;
+    }
+  }
+  return jobs.get(key);
+}
+
+function classifyPreloadError(error) {
+  if (!error) {
+    return 'empty';
+  }
+  if (error.name === 'AbortError') {
+    return 'cancelled';
+  }
+  const message = error && error.message ? String(error.message) : String(error);
+  if (!message) {
+    return 'error';
+  }
+  if (/cancel/i.test(message)) {
+    return 'cancelled';
+  }
+  if (/sequence/i.test(message)) {
+    return 'stale';
+  }
+  if (/timeout/i.test(message)) {
+    return 'timeout';
+  }
+  return message.length > 32 ? `${message.slice(0, 29)}…` : message;
+}
+
+function buildPreloadFailureSummary(info) {
+  const jobs = ensurePreloadJobs(info);
+  const reasons = {};
+  jobs.forEach((job) => {
+    if (!job) {
+      return;
+    }
+    if (job.status === 'failed' || job.status === 'delayed') {
+      const reason = job.reason || 'unknown';
+      reasons[reason] = (reasons[reason] || 0) + 1;
+    }
+  });
+  info.failReasons = reasons;
+  const entries = Object.entries(reasons);
+  if (!entries.length) {
+    return '';
+  }
+  return entries.map(([reason, count]) => `${count}文:${reason}`).join(' / ');
+}
+
+function recomputePreloadAggregates(info) {
+  if (!info) {
+    return;
+  }
+  const jobs = ensurePreloadJobs(info);
+  let completed = 0;
+  let failed = 0;
+  let active = 0;
+  jobs.forEach((job) => {
+    if (!job) {
+      return;
+    }
+    switch (job.status) {
+      case 'success':
+        completed += 1;
+        break;
+      case 'failed':
+      case 'delayed':
+        failed += 1;
+        break;
+      case 'running':
+        active += 1;
+        break;
+      default:
+        break;
+    }
+  });
+  info.completed = completed;
+  info.failed = failed;
+  info.active = active;
+  const summary = buildPreloadFailureSummary(info);
+  if (failed > 0) {
+    const label = summary || '原因不明';
+    info.message = `一部失敗（${label}）`;
+    info.allowForce = true;
+  } else {
+    info.failReasons = {};
+    info.allowForce = false;
+    if (info.status === 'running') {
+      if (!info.message || info.message.startsWith('一部失敗')) {
+        info.message = info.slowWarning ? '通常より時間がかかっています' : '音声を準備しています…';
+      }
+    } else if (info.status === 'done') {
+      info.message = '';
+    }
+  }
+}
+
+function finalizePreloadState(info) {
+  if (!info) {
+    return;
+  }
+  const total = info.total || (info.jobs instanceof Map ? info.jobs.size : 0) || 0;
+  const processed = Math.min(total, (info.completed || 0) + (info.failed || 0));
+  if (processed < total) {
+    if (info.status === 'failed' && info.failed === 0) {
+      info.status = 'running';
+    }
+    return;
+  }
   if (info.failed > 0) {
     info.status = 'failed';
     info.allowForce = true;
@@ -479,8 +626,104 @@ function markPreloadSuccess(info) {
     info.allowForce = false;
     info.message = '';
   }
-  updatePreloadUI();
-  notifyPreloadStatus();
+}
+
+function beginPreloadAttempt(info, sentSeq, requestId, attempt, length) {
+  const job = ensurePreloadJob(info, sentSeq, { length });
+  if (!job) {
+    return computePreloadDeadline(length);
+  }
+  job.status = 'running';
+  job.requestId = requestId;
+  job.attempts = attempt;
+  job.reason = '';
+  job.delayed = false;
+  job.startedAt = performance.now();
+  job.deadline = job.startedAt + computePreloadDeadline(job.length);
+  job.lastMeta = {};
+  recomputePreloadAggregates(info);
+  return Math.max(0, job.deadline - job.startedAt);
+}
+
+function markPreloadDelay(info, sentSeq, requestId, reason = 'timeout', meta = {}) {
+  const job = ensurePreloadJob(info, sentSeq);
+  if (!job) {
+    return;
+  }
+  if (job.requestId && requestId && job.requestId !== requestId) {
+    console.info(`DROP stale preload result page_seq=${info.seq} sent_seq=${sentSeq}`, {
+      reason: 'request_mismatch',
+      expected: job.requestId,
+      requestId,
+      status: job.status,
+    });
+    return;
+  }
+  job.status = 'delayed';
+  job.reason = reason || 'timeout';
+  job.delayed = true;
+  job.lastMeta = meta || {};
+  recomputePreloadAggregates(info);
+}
+
+function markPreloadSuccess(info, sentSeq, requestId, meta = {}) {
+  const job = ensurePreloadJob(info, sentSeq);
+  if (!job) {
+    return false;
+  }
+  if (job.requestId && requestId && job.requestId !== requestId) {
+    console.info(`DROP stale preload success page_seq=${info.seq} sent_seq=${sentSeq}`, {
+      reason: 'request_mismatch',
+      expected: job.requestId,
+      requestId,
+    });
+    return false;
+  }
+  const recovered = job.status === 'delayed' || job.status === 'failed';
+  job.status = 'success';
+  job.reason = '';
+  job.delayed = false;
+  job.lastMeta = meta || {};
+  job.completedAt = performance.now();
+  recomputePreloadAggregates(info);
+  finalizePreloadState(info);
+  return recovered;
+}
+
+function markPreloadFailure(info, sentSeq, requestId, reason, meta = {}) {
+  const job = ensurePreloadJob(info, sentSeq);
+  if (!job) {
+    return;
+  }
+  if (job.requestId && requestId && job.requestId !== requestId) {
+    console.info(`DROP stale preload failure page_seq=${info.seq} sent_seq=${sentSeq}`, {
+      reason: 'request_mismatch',
+      expected: job.requestId,
+      requestId,
+    });
+    return;
+  }
+  job.status = 'failed';
+  job.reason = reason || 'unknown';
+  job.delayed = false;
+  job.lastMeta = meta || {};
+  recomputePreloadAggregates(info);
+  finalizePreloadState(info);
+}
+
+function markPreloadRetry(info, sentSeq) {
+  const job = ensurePreloadJob(info, sentSeq);
+  if (!job) {
+    return;
+  }
+  job.status = 'pending';
+  job.reason = '';
+  job.delayed = false;
+  job.requestId = null;
+  job.startedAt = 0;
+  job.deadline = 0;
+  job.lastMeta = {};
+  recomputePreloadAggregates(info);
 }
 
 function raceWithTimeout(promise, timeoutMs, signal) {
@@ -525,7 +768,7 @@ async function startPreloading(seq, page) {
   cancelPreloading('restart');
   if (!page || !Array.isArray(page.phrases)) {
     resetPreloadState({ status: 'done', seq });
-    notifyPreloadStatus();
+    notifyPreloadStatus(state.preload);
     return;
   }
   const phrases = page.phrases.filter((phrase) => phrase && (phrase.length || (phrase.end - phrase.start) > 0));
@@ -544,18 +787,37 @@ async function startPreloading(seq, page) {
     promise: null,
     slowWarning: false,
     allowForce: false,
+    jobs: new Map(),
+    failReasons: {},
   };
   state.preload = info;
+  phrases.forEach((phrase, index) => {
+    const length = Number.isFinite(phrase.length)
+      ? phrase.length
+      : Math.max(0, (phrase.end || 0) - (phrase.start || 0));
+    ensurePreloadJob(info, index + 1, { length });
+  });
+  recomputePreloadAggregates(info);
   updatePreloadUI();
-  notifyPreloadStatus();
+  notifyPreloadStatus(info);
   if (!total) {
-    markPreloadSuccess(info);
+    finalizePreloadState(info);
+    updatePreloadUI();
+    notifyPreloadStatus(info);
     return;
   }
   console.info(`preload start page_seq=${seq}`, { total, concurrency: PRELOAD_CONCURRENCY });
   const controller = new AbortController();
   preloadController = { controller, seq };
   let cursor = 0;
+
+  const estimatedTotal = phrases.reduce((sum, phrase) => {
+    const length = Number.isFinite(phrase.length)
+      ? phrase.length
+      : Math.max(0, (phrase.end || 0) - (phrase.start || 0));
+    return sum + computePreloadDeadline(length);
+  }, 0);
+  const globalThreshold = estimatedTotal * PRELOAD_GLOBAL_FACTOR;
 
   const runJob = async (index) => {
     if (controller.signal.aborted) {
@@ -567,50 +829,92 @@ async function startPreloading(seq, page) {
     }
     const sentSeq = index + 1;
     const preview = sentencePreview(page, phrase);
-    info.active += 1;
     info.currentSentSeq = sentSeq;
     info.currentPreview = preview;
     updatePreloadUI();
+    notifyPreloadStatus(info);
+    const length = Number.isFinite(phrase.length)
+      ? phrase.length
+      : Math.max(0, (phrase.end || 0) - (phrase.start || 0));
     let attempt = 0;
     let success = false;
     let lastReason = '';
     while (!success && attempt <= PRELOAD_MAX_RETRIES && !controller.signal.aborted) {
       attempt += 1;
-      const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch', refresh: attempt > 1 });
+      const refresh = attempt > 1;
+      if (refresh) {
+        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+      }
+      const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch', refresh });
+      const waitMs = beginPreloadAttempt(info, sentSeq, entry.requestId, attempt, length);
+      updatePreloadUI();
+      notifyPreloadStatus(info);
       const started = performance.now();
-      const outcome = await raceWithTimeout(entry.promise, PRELOAD_TIMEOUT_MS, controller.signal);
+      const outcome = await raceWithTimeout(entry.promise, waitMs, controller.signal);
       if (outcome.type === 'aborted') {
-        info.active = Math.max(0, info.active - 1);
+        markPreloadRetry(info, sentSeq);
+        updatePreloadUI();
+        notifyPreloadStatus(info);
         return;
       }
+      let timedOut = false;
+      let chunks = null;
+      let error = null;
       if (outcome.type === 'value') {
-        const chunks = Array.isArray(outcome.value) ? outcome.value : [];
-        const waitMs = Math.round(performance.now() - started);
-        if (chunks.length > 0) {
-          console.info(`preload success page_seq=${seq} sent_seq=${sentSeq}`, { wait_ms: waitMs, attempt });
-          success = true;
-        } else {
-          lastReason = 'empty_chunks';
-          sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
-        }
-      } else if (outcome.type === 'timeout') {
-        lastReason = 'timeout';
-        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+        chunks = outcome.value;
       } else if (outcome.type === 'error') {
-        lastReason = outcome.error && outcome.error.message ? outcome.error.message : 'error';
-        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+        error = outcome.error;
+      } else if (outcome.type === 'timeout') {
+        timedOut = true;
+        markPreloadDelay(info, sentSeq, entry.requestId, 'timeout', {
+          wait_ms: Math.round(performance.now() - started),
+          attempt,
+        });
+        updatePreloadUI();
+        notifyPreloadStatus(info);
+        try {
+          chunks = await entry.promise;
+        } catch (err) {
+          error = err;
+        }
       }
-    }
-    info.active = Math.max(0, info.active - 1);
-    if (success) {
-      info.completed += 1;
-    } else {
-      markPreloadFailure(info, sentSeq, lastReason || 'unknown');
+      if (controller.signal.aborted) {
+        markPreloadRetry(info, sentSeq);
+        updatePreloadUI();
+        notifyPreloadStatus(info);
+        return;
+      }
+      const chunkList = Array.isArray(chunks) ? chunks : [];
+      if (chunkList.length > 0) {
+        const recovered = markPreloadSuccess(info, sentSeq, entry.requestId, {
+          wait_ms: Math.round(performance.now() - started),
+          attempt,
+          timed_out: timedOut,
+        });
+        console.info(`preload success page_seq=${seq} sent_seq=${sentSeq}`, {
+          wait_ms: Math.round(performance.now() - started),
+          attempt,
+          recovered,
+        });
+        success = true;
+      } else {
+        lastReason = timedOut ? 'timeout' : classifyPreloadError(error);
+        if (attempt <= PRELOAD_MAX_RETRIES) {
+          markPreloadRetry(info, sentSeq);
+          continue;
+        }
+        markPreloadFailure(info, sentSeq, entry.requestId, lastReason || 'unknown', {
+          attempt,
+        });
+        console.warn(`preload failed page_seq=${seq} sent_seq=${sentSeq}`, { reason: lastReason || 'unknown' });
+      }
+      updatePreloadUI();
+      notifyPreloadStatus(info);
     }
     info.currentSentSeq = 0;
     info.currentPreview = '';
     updatePreloadUI();
-    notifyPreloadStatus();
+    notifyPreloadStatus(info);
   };
 
   const workers = Array.from({ length: Math.min(PRELOAD_CONCURRENCY, total) }, async () => {
@@ -624,18 +928,21 @@ async function startPreloading(seq, page) {
     }
   });
 
-  const globalThreshold = total * PRELOAD_TIMEOUT_MS * PRELOAD_GLOBAL_FACTOR;
-
   info.promise = Promise.all(workers)
     .then(() => {
       if (controller.signal.aborted) {
         info.status = 'cancelled';
         info.message = '';
         updatePreloadUI();
-        notifyPreloadStatus({ status: 'cancelled' });
+        notifyPreloadStatus(info, { status: 'cancelled' });
         return;
       }
-      markPreloadSuccess(info);
+      finalizePreloadState(info);
+      updatePreloadUI();
+      notifyPreloadStatus(info);
+    })
+    .catch((err) => {
+      console.warn('preload worker failed', err);
     })
     .finally(() => {
       preloadController = null;
@@ -650,9 +957,11 @@ async function startPreloading(seq, page) {
       const elapsed = performance.now() - info.startedAt;
       if (!info.slowWarning && globalThreshold > 0 && elapsed > globalThreshold) {
         info.slowWarning = true;
-        info.message = '通常より時間がかかっています';
+        if (!info.failReasons || !Object.keys(info.failReasons).length) {
+          info.message = '通常より時間がかかっています';
+        }
         updatePreloadUI();
-        notifyPreloadStatus();
+        notifyPreloadStatus(info);
       }
     }
   })();
@@ -2106,7 +2415,7 @@ const handlers = {
         state.preload.message = '';
         state.preload.allowForce = false;
         updatePreloadUI();
-        notifyPreloadStatus({ status: 'forced' });
+        notifyPreloadStatus(state.preload, { status: 'forced' });
       }
     } else {
       await waitForPreloadCompletion();
