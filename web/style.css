@@ -200,6 +200,97 @@ body.show-answer #answerPanel {
   display: flex;
 }
 
+.hidden {
+  display: none !important;
+}
+
+.preload-status {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 20;
+  pointer-events: none;
+  transition: opacity var(--transition-fast) ease;
+}
+
+.preload-status .preload-card {
+  min-width: clamp(240px, 40vw, 420px);
+  max-width: min(90vw, 480px);
+  margin: 0 auto;
+  padding: 16px 20px;
+  border-radius: 12px;
+  background: rgba(20, 24, 32, 0.82);
+  color: #ffffff;
+  box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.preload-title {
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+}
+
+.preload-bar {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.18);
+  overflow: hidden;
+}
+
+.preload-bar-fill {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, rgba(118, 156, 191, 0.85), rgba(118, 156, 191, 0.45));
+  transition: width 160ms ease;
+}
+
+.preload-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  opacity: 0.9;
+}
+
+.preload-preview {
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.preload-message {
+  font-size: 13px;
+  color: #ffd966;
+  min-height: 18px;
+}
+
+.preload-force {
+  align-self: flex-end;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  background: rgba(191, 118, 118, 0.92);
+  color: #ffffff;
+  cursor: pointer;
+  transition: background var(--transition-fast) ease;
+}
+
+.preload-force:hover,
+.preload-force:focus-visible {
+  background: rgba(191, 118, 118, 1);
+}
+
 #contentShell.auto-scroll #content {
   overflow: visible;
 }

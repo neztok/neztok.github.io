@@ -159,6 +159,21 @@ const state = {
   connectionStage: 'disconnected',
   readyByUser: false,
   activeSeq: 0,
+  preload: {
+    status: 'idle',
+    seq: 0,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    active: 0,
+    currentSentSeq: 0,
+    currentPreview: '',
+    startedAt: 0,
+    message: '',
+    promise: null,
+    slowWarning: false,
+    allowForce: false,
+  },
 };
 
 const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
@@ -166,7 +181,10 @@ const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 const TTS_RESULT_TIMEOUT_MS = 500;
 const SILENCE_FALLBACK_DELAY_MS = 120;
 const AUDIO_SYNC_WAIT_MS = 500;
-const PREFETCH_LOOKAHEAD = 1;
+const PRELOAD_TIMEOUT_MS = 5000;
+const PRELOAD_MAX_RETRIES = 1;
+const PRELOAD_CONCURRENCY = 3;
+const PRELOAD_GLOBAL_FACTOR = 0.6;
 
 let elements = {};
 let statusFrameToken = null;
@@ -176,6 +194,7 @@ const sentenceAudioCache = new Map();
 let flowController = null;
 let readyNotified = false;
 let playbackQueueTail = Promise.resolve();
+let preloadController = null;
 
 const CONNECTION_LABELS = {
   disconnected: '未接続',
@@ -283,8 +302,12 @@ function clearSentenceAudioCache(reason = 'clear') {
 
 function ensureSentenceAudio(seq, sentSeq, options = {}) {
   const key = sentenceCacheKey(seq, sentSeq);
-  const existing = sentenceAudioCache.get(key);
   const mode = options.mode || 'playback';
+  const refresh = Boolean(options.refresh);
+  if (refresh) {
+    sentenceAudioCache.delete(key);
+  }
+  const existing = sentenceAudioCache.get(key);
   if (existing) {
     if (mode === 'playback' && existing.mode === 'prefetch' && !existing.promoted) {
       existing.promoted = true;
@@ -321,38 +344,318 @@ function ensureSentenceAudio(seq, sentSeq, options = {}) {
   return entry;
 }
 
-function prefetchSentences(seq, page, startIndex = 0) {
-  if (!Number.isFinite(seq) || seq <= 0) {
+function resetPreloadState(overrides = {}) {
+  state.preload = {
+    status: 'idle',
+    seq: 0,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    active: 0,
+    currentSentSeq: 0,
+    currentPreview: '',
+    startedAt: 0,
+    message: '',
+    promise: null,
+    slowWarning: false,
+    allowForce: false,
+    ...overrides,
+  };
+  updatePreloadUI();
+}
+
+function cancelPreloading(reason = 'cancelled') {
+  if (preloadController && preloadController.controller && !preloadController.controller.signal.aborted) {
+    try {
+      preloadController.controller.abort();
+    } catch (err) {
+      console.error('preload abort failed', err);
+    }
+    console.info(`preload cancel page_seq=${preloadController.seq}`, { reason });
+  }
+  preloadController = null;
+}
+
+function computePreloadPercent(info) {
+  if (!info || !info.total) {
+    return info && info.status === 'done' ? 100 : 0;
+  }
+  const processed = Math.min(info.total, info.completed + info.failed);
+  return Math.max(0, Math.min(100, Math.round((processed / info.total) * 100)));
+}
+
+function currentPreloadSeq() {
+  return state.preload && state.preload.seq ? state.preload.seq : state.activeSeq;
+}
+
+function notifyPreloadStatus(overrides = {}) {
+  const info = state.preload || {};
+  const payload = {
+    status: info.status || 'idle',
+    total: info.total || 0,
+    completed: info.completed || 0,
+    failed: info.failed || 0,
+    active: info.active || 0,
+    percent: computePreloadPercent(info),
+    currentSentSeq: info.currentSentSeq || 0,
+    preview: info.currentPreview || '',
+    message: info.message || '',
+    allowForce: Boolean(info.allowForce),
+    elapsedMs: info.startedAt ? Math.round(performance.now() - info.startedAt) : 0,
+    seq: currentPreloadSeq(),
+    ...overrides,
+  };
+  console.info(`preload status page_seq=${payload.seq}`, payload);
+  sendEvent('PRELOAD_STATUS', payload, { seq: payload.seq });
+}
+
+function updatePreloadUI() {
+  if (!elements.preloadStatus) {
     return;
   }
-  if (seq < state.activeSeq) {
+  const info = state.preload || {};
+  const visible = info.status === 'running' || info.status === 'failed';
+  elements.preloadStatus.classList.toggle('hidden', !visible);
+  const percent = computePreloadPercent(info);
+  if (elements.preloadBarFill) {
+    elements.preloadBarFill.style.width = `${percent}%`;
+  }
+  if (elements.preloadPercent) {
+    elements.preloadPercent.textContent = `${percent}%`;
+  }
+  if (elements.preloadCount) {
+    const total = info.total || 0;
+    const processed = Math.min(total, info.completed + info.failed);
+    elements.preloadCount.textContent = `${processed}/${total}`;
+  }
+  if (elements.preloadPreview) {
+    if (info.currentSentSeq && info.currentPreview) {
+      elements.preloadPreview.textContent = `現在: 「${info.currentPreview}」`;
+    } else {
+      elements.preloadPreview.textContent = '';
+    }
+  }
+  if (elements.preloadMessage) {
+    elements.preloadMessage.textContent = info.message || '';
+  }
+  if (elements.preloadForceButton) {
+    const showForce = info.status === 'failed' && info.failed > 0;
+    elements.preloadForceButton.classList.toggle('hidden', !showForce);
+    elements.preloadForceButton.disabled = !showForce;
+  }
+}
+
+async function waitForPreloadCompletion({ force = false } = {}) {
+  const info = state.preload;
+  if (!info || !info.promise) {
     return;
   }
-  if (!page || !Array.isArray(page.phrases) || page.phrases.length === 0) {
+  if (force) {
+    cancelPreloading('forced_start');
     return;
   }
-  const limit = Math.min(page.phrases.length, startIndex + PREFETCH_LOOKAHEAD + 1);
-  for (let idx = startIndex; idx < limit; idx += 1) {
-    const phrase = page.phrases[idx];
+  if (info.status === 'running') {
+    try {
+      await info.promise;
+    } catch (err) {
+      console.warn('preload wait failed', err);
+    }
+  }
+}
+
+function markPreloadFailure(info, sentSeq, reason) {
+  info.failed += 1;
+  info.message = `${info.failed}文失敗（無音再生）`;
+  info.allowForce = true;
+  console.warn(`preload failed page_seq=${info.seq} sent_seq=${sentSeq}`, { reason });
+}
+
+function markPreloadSuccess(info) {
+  if (info.failed > 0) {
+    info.status = 'failed';
+    info.allowForce = true;
+  } else {
+    info.status = 'done';
+    info.allowForce = false;
+    info.message = '';
+  }
+  updatePreloadUI();
+  notifyPreloadStatus();
+}
+
+function raceWithTimeout(promise, timeoutMs, signal) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (signal && abortHandler) {
+        signal.removeEventListener('abort', abortHandler);
+      }
+    };
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const abortHandler = () => finish({ type: 'aborted' });
+    if (signal) {
+      if (signal.aborted) {
+        finish({ type: 'aborted' });
+        return;
+      }
+      signal.addEventListener('abort', abortHandler, { once: true });
+    }
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => finish({ type: 'timeout' }), timeoutMs);
+    }
+    Promise.resolve(promise)
+      .then((value) => finish({ type: 'value', value }))
+      .catch((error) => finish({ type: 'error', error }));
+  });
+}
+
+async function startPreloading(seq, page) {
+  cancelPreloading('restart');
+  if (!page || !Array.isArray(page.phrases)) {
+    resetPreloadState({ status: 'done', seq });
+    notifyPreloadStatus();
+    return;
+  }
+  const phrases = page.phrases.filter((phrase) => phrase && (phrase.length || (phrase.end - phrase.start) > 0));
+  const total = phrases.length;
+  const info = {
+    status: total ? 'running' : 'done',
+    seq,
+    total,
+    completed: 0,
+    failed: 0,
+    active: 0,
+    currentSentSeq: 0,
+    currentPreview: '',
+    startedAt: performance.now(),
+    message: total ? '音声を準備しています…' : '',
+    promise: null,
+    slowWarning: false,
+    allowForce: false,
+  };
+  state.preload = info;
+  updatePreloadUI();
+  notifyPreloadStatus();
+  if (!total) {
+    markPreloadSuccess(info);
+    return;
+  }
+  console.info(`preload start page_seq=${seq}`, { total, concurrency: PRELOAD_CONCURRENCY });
+  const controller = new AbortController();
+  preloadController = { controller, seq };
+  let cursor = 0;
+
+  const runJob = async (index) => {
+    if (controller.signal.aborted) {
+      return;
+    }
+    const phrase = phrases[index];
     if (!phrase) {
-      continue;
+      return;
     }
-    const length = phrase.length || (phrase.end - phrase.start);
-    if (length <= 0) {
-      continue;
+    const sentSeq = index + 1;
+    const preview = sentencePreview(page, phrase);
+    info.active += 1;
+    info.currentSentSeq = sentSeq;
+    info.currentPreview = preview;
+    updatePreloadUI();
+    let attempt = 0;
+    let success = false;
+    let lastReason = '';
+    while (!success && attempt <= PRELOAD_MAX_RETRIES && !controller.signal.aborted) {
+      attempt += 1;
+      const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch', refresh: attempt > 1 });
+      const started = performance.now();
+      const outcome = await raceWithTimeout(entry.promise, PRELOAD_TIMEOUT_MS, controller.signal);
+      if (outcome.type === 'aborted') {
+        info.active = Math.max(0, info.active - 1);
+        return;
+      }
+      if (outcome.type === 'value') {
+        const chunks = Array.isArray(outcome.value) ? outcome.value : [];
+        const waitMs = Math.round(performance.now() - started);
+        if (chunks.length > 0) {
+          console.info(`preload success page_seq=${seq} sent_seq=${sentSeq}`, { wait_ms: waitMs, attempt });
+          success = true;
+        } else {
+          lastReason = 'empty_chunks';
+          sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+        }
+      } else if (outcome.type === 'timeout') {
+        lastReason = 'timeout';
+        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+      } else if (outcome.type === 'error') {
+        lastReason = outcome.error && outcome.error.message ? outcome.error.message : 'error';
+        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+      }
     }
-    const sentSeq = idx + 1;
-    const key = sentenceCacheKey(seq, sentSeq);
-    const existed = sentenceAudioCache.has(key);
-    const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch' });
-    if (!existed) {
-      console.info(`prefetch queued page_seq=${seq} sent_seq=${sentSeq}`, {
-        preview: sentencePreview(page, phrase),
-      });
-    } else if (entry.mode === 'prefetch') {
-      console.debug(`prefetch reuse page_seq=${seq} sent_seq=${sentSeq}`);
+    info.active = Math.max(0, info.active - 1);
+    if (success) {
+      info.completed += 1;
+    } else {
+      markPreloadFailure(info, sentSeq, lastReason || 'unknown');
     }
-  }
+    info.currentSentSeq = 0;
+    info.currentPreview = '';
+    updatePreloadUI();
+    notifyPreloadStatus();
+  };
+
+  const workers = Array.from({ length: Math.min(PRELOAD_CONCURRENCY, total) }, async () => {
+    while (!controller.signal.aborted) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= total) {
+        return;
+      }
+      await runJob(index);
+    }
+  });
+
+  const globalThreshold = total * PRELOAD_TIMEOUT_MS * PRELOAD_GLOBAL_FACTOR;
+
+  info.promise = Promise.all(workers)
+    .then(() => {
+      if (controller.signal.aborted) {
+        info.status = 'cancelled';
+        info.message = '';
+        updatePreloadUI();
+        notifyPreloadStatus({ status: 'cancelled' });
+        return;
+      }
+      markPreloadSuccess(info);
+    })
+    .finally(() => {
+      preloadController = null;
+    });
+
+  (async () => {
+    while (info.status === 'running') {
+      await delay(500);
+      if (info.status !== 'running') {
+        break;
+      }
+      const elapsed = performance.now() - info.startedAt;
+      if (!info.slowWarning && globalThreshold > 0 && elapsed > globalThreshold) {
+        info.slowWarning = true;
+        info.message = '通常より時間がかかっています';
+        updatePreloadUI();
+        notifyPreloadStatus();
+      }
+    }
+  })();
 }
 
 function activateSequence(seq) {
@@ -1306,7 +1609,6 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
   if (!isFlowActive(flow)) {
     return false;
   }
-  prefetchSentences(seq, page, sentenceIndex + 1);
   return true;
 }
 
@@ -1701,6 +2003,7 @@ async function setPage(index, options = {}) {
   typewriter.stop();
   state.typedLength = 0;
   state.phraseIndex = 0;
+  cancelPreloading('set_page');
   resetPlaybackState({
     flushAudio: options.flushAudio !== false,
     preserveAudioCache: Boolean(options.preserveAudioCache),
@@ -1776,7 +2079,7 @@ const handlers = {
     console.info(`split result page_seq=${pageSeq}`, { count: sentences.length, lengths });
     console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: sentences.length });
     sendEvent('SENTENCES_READY', { count: sentences.length, samples, sentences, lengths }, { seq: pageSeq });
-    prefetchSentences(pageSeq, page, 0);
+    await startPreloading(pageSeq, page);
   },
 
   async START(data = {}, seq) {
@@ -1785,16 +2088,32 @@ const handlers = {
     }
     const active = state.activeSeq;
     console.info(`rx START page_seq=${active}`);
+    const force = Boolean(data.force);
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     const needsReset = fromPage !== state.pageIndex;
     await setPage(fromPage, {
       flushAudio: needsReset,
       preserveAudioCache: !needsReset,
     });
-    prefetchSentences(state.activeSeq, currentPage(), 0);
     await waitForUserReady();
     if (active !== state.activeSeq) {
       return;
+    }
+    if (force) {
+      await waitForPreloadCompletion({ force: true });
+      if (state.preload) {
+        state.preload.status = 'forced';
+        state.preload.message = '';
+        state.preload.allowForce = false;
+        updatePreloadUI();
+        notifyPreloadStatus({ status: 'forced' });
+      }
+    } else {
+      await waitForPreloadCompletion();
+      if (state.preload && state.preload.status === 'failed') {
+        console.warn('START aborted because preload failed without force');
+        return;
+      }
     }
     const page = currentPage();
     if (!page) {
@@ -1866,7 +2185,7 @@ const handlers = {
     console.info(`split result page_seq=${state.activeSeq}`, { count: sentences.length, lengths });
     console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: sentences.length });
     sendEvent('SENTENCES_READY', { count: sentences.length, samples, sentences, lengths }, { seq: state.activeSeq });
-    prefetchSentences(state.activeSeq, page, 0);
+    await startPreloading(state.activeSeq, page);
   },
 
   SET_CPS(data = {}, seq) {
@@ -2007,12 +2326,29 @@ document.addEventListener('DOMContentLoaded', () => {
     answers: document.getElementById('answers'),
     explain: document.getElementById('explain'),
     connection: document.getElementById('connectionBadge'),
+    preloadStatus: document.getElementById('preloadStatus'),
+    preloadBarFill: document.getElementById('preloadBarFill'),
+    preloadPercent: document.getElementById('preloadPercent'),
+    preloadCount: document.getElementById('preloadCount'),
+    preloadPreview: document.getElementById('preloadPreview'),
+    preloadMessage: document.getElementById('preloadMessage'),
+    preloadForceButton: document.getElementById('preloadForceButton'),
   };
   applyZoom(state.zoom);
   setCompact(state.compact);
   updateSettingsHint();
   updateConnectionBadge();
   scheduleStatus();
+  if (elements.preloadForceButton) {
+    elements.preloadForceButton.addEventListener('click', () => {
+      if (!state.preload || state.preload.status !== 'failed') {
+        return;
+      }
+      console.info('preload force requested by presenter');
+      sendEvent('FORCE_START_REQUEST', { reason: 'presenter' }, { seq: currentPreloadSeq() });
+    });
+  }
+  updatePreloadUI();
 });
 
 window.addEventListener('error', (event) => {

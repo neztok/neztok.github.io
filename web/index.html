@@ -26,6 +26,21 @@
         <p id="answers"></p>
         <div id="explain"></div>
       </aside>
+      <div id="preloadStatus" class="preload-status hidden">
+        <div class="preload-card">
+          <div class="preload-title">音声を準備しています…</div>
+          <div class="preload-bar">
+            <div id="preloadBarFill" class="preload-bar-fill"></div>
+          </div>
+          <div class="preload-meta">
+            <span id="preloadPercent">0%</span>
+            <span id="preloadCount">0/0</span>
+          </div>
+          <div id="preloadPreview" class="preload-preview"></div>
+          <div id="preloadMessage" class="preload-message"></div>
+          <button id="preloadForceButton" type="button" class="preload-force hidden">それでも開始</button>
+        </div>
+      </div>
     </div>
     <script type="module" src="./app.js"></script>
   </body>
