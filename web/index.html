@@ -1,11 +1,11 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="ja" data-build="__BUILD_ID__">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Quiz Presentation</title>
     <base href="./">
-    <link rel="stylesheet" href="./style.css" />
+    <link rel="stylesheet" href="./style.css?v=__BUILD_ID__" />
   </head>
   <body>
     <div id="app" class="compact" data-zoom="1.1">
@@ -36,12 +36,13 @@
             <span id="preloadPercent">0%</span>
             <span id="preloadCount">0/0</span>
           </div>
+          <div id="preloadBreakdown" class="preload-breakdown"></div>
           <div id="preloadPreview" class="preload-preview"></div>
           <div id="preloadMessage" class="preload-message"></div>
           <button id="preloadForceButton" type="button" class="preload-force hidden">それでも開始</button>
         </div>
       </div>
     </div>
-    <script type="module" src="./app.js"></script>
+    <script type="module" src="./app.js?v=__BUILD_ID__"></script>
   </body>
 </html>

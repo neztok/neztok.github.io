@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -39,6 +40,9 @@ class PresentationServer:
         self.stop_event = threading.Event()
         self.start_exception: Optional[BaseException] = None
         self.web_dir = Path(__file__).resolve().parent.parent / "web"
+        self._version_seed = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        self._asset_version_locked = False
+        self.asset_version = self._compute_asset_version()
         self.pending_to_control: List[str] = []
         self.pending_to_presentation: List[str] = []
         self.control_ws: Optional[web.WebSocketResponse] = None
@@ -71,6 +75,34 @@ class PresentationServer:
         self.app.router.add_get("/favicon.ico", self._serve_static)
         self.app.router.add_route("GET", "/{path:.*}", self._serve_static)
         self.app.router.add_route("HEAD", "/{path:.*}", self._serve_static)
+
+    def _compute_asset_version(self) -> str:
+        fingerprint_parts = []
+        for name in ("app.js", "style.css"):
+            path = (self.web_dir / name).resolve()
+            if path.exists():
+                stat = path.stat()
+                fingerprint_parts.append(f"{name}:{stat.st_mtime_ns}:{stat.st_size}")
+        if not fingerprint_parts:
+            return self._version_seed
+        digest = hashlib.sha1("|".join(fingerprint_parts).encode("utf-8")).hexdigest()[:12]
+        return f"{self._version_seed}-{digest}"
+
+    def _refresh_asset_version(self) -> None:
+        if self._asset_version_locked:
+            return
+        computed = self._compute_asset_version()
+        if computed != self.asset_version:
+            logging.info("Asset version updated: %s -> %s", self.asset_version, computed)
+            self.asset_version = computed
+
+    def set_asset_version(self, value: str) -> None:
+        if value:
+            self.asset_version = value
+            self._asset_version_locked = True
+
+    def get_asset_version(self) -> str:
+        return self.asset_version
 
     def start(self) -> None:
         if self.thread:
@@ -350,8 +382,22 @@ class PresentationServer:
         else:
             await self._broadcast_to_control_http(message)
 
+    def _render_index(self) -> str:
+        template_path = (self.web_dir / "index.html").resolve()
+        if not template_path.exists():
+            raise web.HTTPNotFound()
+        try:
+            raw = template_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise web.HTTPInternalServerError(reason="Failed to read index template") from exc
+        self._refresh_asset_version()
+        build_id = self.asset_version or self._compute_asset_version()
+        return raw.replace("__BUILD_ID__", build_id)
+
     async def _serve_index(self, request: web.Request) -> web.StreamResponse:
-        return await self._serve_static(request, filename="index.html")
+        content = self._render_index()
+        headers = {"Cache-Control": "no-store, must-revalidate"}
+        return web.Response(text=content, content_type="text/html", headers=headers)
 
     async def _serve_static(self, request: web.Request, filename: Optional[str] = None) -> web.StreamResponse:
         if request.method not in {"GET", "HEAD"}:
@@ -369,7 +415,13 @@ class PresentationServer:
             target = target / "index.html"
         if not target.exists() or not target.is_file():
             raise web.HTTPNotFound()
-        return web.FileResponse(target)
+        name = target.name
+        if name in {"app.js", "style.css"}:
+            self._refresh_asset_version()
+        response = web.FileResponse(target)
+        if name in {"app.js", "style.css", "index.html"}:
+            response.headers["Cache-Control"] = "no-store, must-revalidate"
+        return response
 
 
 class PresenterApp:
@@ -378,7 +430,12 @@ class PresenterApp:
         self.port = port
         self.debug = debug or env_flag("DEBUG")
         self.server = PresentationServer("127.0.0.1", port, bridge, debug=self.debug)
-        self.asset_version = os.environ.get("PRESENTATION_INDEX_VERSION") or str(int(time.time()))
+        env_version = os.environ.get("PRESENTATION_INDEX_VERSION")
+        if env_version:
+            self.asset_version = env_version
+            self.server.set_asset_version(env_version)
+        else:
+            self.asset_version = self.server.get_asset_version()
 
     def run(self) -> None:
         try:
