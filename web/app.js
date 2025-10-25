@@ -216,7 +216,7 @@ function markUserReady() {
       console.error('user-ready resolver failed', err);
     }
   });
-  sendCommand('USER_READY', { at: Date.now() });
+  sendEvent('PRESENTER_READY', { at: Date.now() }, { seq: state.activeSeq });
 }
 
 function setupUserReadyListeners() {
@@ -284,12 +284,15 @@ function activateSequence(seq) {
   return state.activeSeq;
 }
 
-function ensureSequence(data = {}) {
-  if (!data || typeof data.seq === 'undefined') {
-    return true;
+function ensureSequence(data = {}, seqFromMessage) {
+  let seq = Number.isFinite(seqFromMessage) ? seqFromMessage : undefined;
+  if (typeof seq === 'undefined' && data && typeof data.seq !== 'undefined') {
+    const parsed = Number.parseInt(data.seq, 10);
+    if (!Number.isNaN(parsed)) {
+      seq = parsed;
+    }
   }
-  const seq = Number.parseInt(data.seq, 10);
-  if (Number.isNaN(seq)) {
+  if (typeof seq === 'undefined') {
     return true;
   }
   if (seq < state.activeSeq) {
@@ -571,7 +574,7 @@ function ensureBridge() {
     });
     bridgeConnection.onOpen(() => {
       setConnectionStage('connected');
-      notifyReady();
+      notifyBridgeConnected();
     });
   }
   return bridgeConnection;
@@ -606,13 +609,21 @@ function setBridgeReceiver(handler) {
   }
 }
 
-function sendCommand(action, data = {}, options = {}) {
+function sendEvent(type, payload = {}, options = {}) {
   const bridge = ensureBridge();
-  const payload = { ...(data || {}) };
-  if (options.includeSeq !== false && typeof payload.seq === 'undefined') {
-    payload.seq = state.activeSeq;
+  const message = { type };
+  const body = payload && typeof payload === 'object' ? { ...payload } : {};
+  let seqValue;
+  if (Object.prototype.hasOwnProperty.call(options, 'seq')) {
+    seqValue = options.seq;
+  } else if (options.includeSeq !== false) {
+    seqValue = state.activeSeq;
   }
-  bridge.send({ action, data: payload });
+  if (typeof seqValue === 'number' && Number.isFinite(seqValue)) {
+    message.seq = seqValue;
+  }
+  message.payload = body;
+  bridge.send(message);
 }
 
 function segmentGraphemes(text) {
@@ -850,23 +861,19 @@ function settleTtsPromise(requestId, callback) {
 function requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }) {
   return new Promise((resolve, reject) => {
     registerTtsPromise(requestId, seq, sentSeq, resolve, reject);
-    sendCommand(
-      'TTS_REQUEST',
-      {
-        seq,
-        sentSeq,
-        requestId,
-        slice: [
-          {
-            id: requestId,
-            startChar,
-            endChar,
-            sentSeq,
-          },
-        ],
-      },
-      { includeSeq: false },
-    );
+    sendEvent('TTS_REQUEST', {
+      seq,
+      sentSeq,
+      requestId,
+      slice: [
+        {
+          id: requestId,
+          startChar,
+          endChar,
+          sentSeq,
+        },
+      ],
+    }, { seq });
   });
 }
 
@@ -1080,7 +1087,7 @@ function sendStatus() {
     phraseIndex: Math.max(1, state.phraseIndex + 1),
     ttsQueue: audioManager.queueLength(),
   };
-  sendCommand('STATUS', payload);
+  sendEvent('STATUS', payload);
 }
 
 function flashOverlay() {
@@ -1441,17 +1448,36 @@ async function setPage(index, options = {}) {
 function reportError(code, error) {
   console.error(code, error);
   const message = error && error.message ? error.message : String(error);
-  sendCommand('ERROR', { code, message });
+  sendEvent('ERROR', { code, message });
 }
 
 const handlers = {
-  async load_question(data = {}) {
-    if (!ensureSequence(data)) {
+  PAGE_SEQ(_data = {}, seq) {
+    if (!Number.isFinite(seq)) {
       return;
     }
-    const seq = Number.isInteger(data.seq) ? data.seq : Number.parseInt(data.seq, 10);
+    const target = Number(seq);
+    console.info(`rx PAGE_SEQ seq=${target}`);
+    activateSequence(target);
+    sendEvent('PRESENTER_ACK', { ack: 'PAGE_SEQ' }, { seq: target });
+    setStatusHint('待機中');
+    scheduleStatus();
+  },
+
+  PRESENTATION_INIT() {
+    setConnectionStage('ready');
+    if (!state.question) {
+      setStatusHint('待機中');
+      scheduleStatus();
+    }
+  },
+
+  async PRESENT(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
+      return;
+    }
     const pageSeq = Number.isFinite(seq) ? seq : state.activeSeq;
-    console.info(`rx present page_seq=${pageSeq}`);
+    console.info(`rx PRESENT page_seq=${pageSeq}`);
     state.question = data;
     state.fullText = data.text || '';
     if (elements.title) {
@@ -1463,26 +1489,23 @@ const handlers = {
     await setPage(0, { flushAudio: true });
     setStatusHint('待機中');
     scheduleStatus();
+    const page = currentPage();
+    const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
+    console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: phrases.length });
+    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: pageSeq });
   },
 
-  presentation_init() {
-    setConnectionStage('ready');
-    if (!state.question) {
-      setStatusHint('待機中');
-      scheduleStatus();
-    }
-  },
-
-  async start(data = {}) {
-    if (!ensureSequence(data)) {
+  async START(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
-    console.info(`rx start page_seq=${state.activeSeq}`);
-    const expectedSeq = state.activeSeq;
+    const active = state.activeSeq;
+    console.info(`rx START page_seq=${active}`);
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
     await setPage(fromPage, { flushAudio: true });
     await waitForUserReady();
-    if (expectedSeq !== state.activeSeq) {
+    if (active !== state.activeSeq) {
       return;
     }
     const page = currentPage();
@@ -1497,7 +1520,10 @@ const handlers = {
     await runPresentationFlow(0);
   },
 
-  stop_all() {
+  STOP_ALL(_data = {}, seq) {
+    if (!ensureSequence({}, seq)) {
+      return;
+    }
     cancelFlowController('stopped');
     audioManager.flush();
     rejectPendingTts('stopped');
@@ -1506,12 +1532,13 @@ const handlers = {
     scheduleStatus();
   },
 
-  async resume(data = {}) {
-    if (!ensureSequence(data)) {
+  async RESUME(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     console.info(`rx resume page_seq=${state.activeSeq}`);
     const expectedSeq = state.activeSeq;
+    console.info(`rx RESUME page_seq=${expectedSeq}`);
     await waitForUserReady();
     if (expectedSeq !== state.activeSeq) {
       return;
@@ -1530,17 +1557,22 @@ const handlers = {
     await runPresentationFlow(index);
   },
 
-  async goto_page(data = {}) {
-    if (!ensureSequence(data)) {
+  async GOTO_PAGE(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     const index = Number.isInteger(data.page) ? data.page : 0;
     await setPage(index, { flushAudio: true });
     setStatusHint(`ページ ${state.pageIndex + 1}`);
+    const page = currentPage();
+    const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
+    console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: phrases.length });
+    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: state.activeSeq });
   },
 
-  set_cps(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_CPS(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     if (typeof data.value === 'number') {
@@ -1550,8 +1582,8 @@ const handlers = {
     }
   },
 
-  set_pause_factor(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_PAUSE_FACTOR(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     if (typeof data.value === 'number') {
@@ -1561,8 +1593,8 @@ const handlers = {
     }
   },
 
-  set_zoom(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_ZOOM(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     if (typeof data.value === 'number') {
@@ -1570,28 +1602,35 @@ const handlers = {
     }
   },
 
-  set_compact(data = {}) {
-    if (!ensureSequence(data)) {
+  SET_COMPACT(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
     setCompact(Boolean(data.value));
   },
 
-  reveal_answer(data = {}) {
-    if (!ensureSequence(data)) {
+  REVEAL(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
       return;
     }
-    console.info(`rx reveal page_seq=${state.activeSeq}`);
+    console.info(`rx REVEAL page_seq=${state.activeSeq}`);
     document.body.classList.add('show-answer');
   },
 
-  tts_result(data = {}) {
-    const ok = ensureSequence(data);
+  CLEAR(data = {}, seq) {
+    if (!ensureSequence(data, seq)) {
+      return;
+    }
+    clearAnswerPanel();
+  },
+
+  TTS_RESULT(data = {}, seq) {
+    const ok = ensureSequence(data, seq);
     const requestId = data && data.requestId;
     if (!requestId) {
       return;
     }
-    const resultSeq = Number.isInteger(data.seq) ? data.seq : Number.parseInt(data.seq, 10);
+    const resultSeq = Number.isInteger(seq) ? seq : Number.parseInt(seq, 10);
     const resultSentSeq = Number.isInteger(data.sentSeq) ? data.sentSeq : Number.parseInt(data.sentSeq, 10);
     settleTtsPromise(requestId, ({ resolve, reject, seq: expectedSeq, sentSeq: expectedSentSeq }) => {
       if (!ok) {
@@ -1626,12 +1665,21 @@ window.appBridge = {
   receive(message) {
     try {
       const payload = typeof message === 'string' ? JSON.parse(message) : message;
-      if (!payload || !payload.action) {
+      if (!payload) {
         return;
       }
-      const handler = handlers[payload.action];
+      const type = payload.type || payload.action;
+      if (!type) {
+        return;
+      }
+      const handler = handlers[type];
       if (handler) {
-        Promise.resolve(handler(payload.data || {})).catch((err) => reportError('handler_failed', err));
+        const seq = typeof payload.seq === 'number' ? payload.seq : Number.parseInt(payload.seq, 10);
+        const body = payload.payload && typeof payload.payload === 'object' ? { ...payload.payload } : {};
+        if (Number.isFinite(seq) && typeof body.seq === 'undefined') {
+          body.seq = seq;
+        }
+        Promise.resolve(handler(body, seq, payload)).catch((err) => reportError('handler_failed', err));
       }
     } catch (err) {
       reportError('receive_failed', err);
@@ -1643,10 +1691,10 @@ setBridgeReceiver(window.appBridge.receive);
 ensureBridge();
 setupUserReadyListeners();
 
-function notifyReady() {
+function notifyBridgeConnected() {
   if (readyNotified) return;
   readyNotified = true;
-  sendCommand('READY', {});
+  sendEvent('PRESENTER_CONNECTED', {});
 }
 
 document.addEventListener('DOMContentLoaded', () => {

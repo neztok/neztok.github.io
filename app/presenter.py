@@ -343,8 +343,8 @@ class PresentationServer:
         if self.loop.is_running() and not self.loop.is_closed():
             self.loop.call_soon_threadsafe(self.loop.stop)
 
-    async def _send_event_to_control(self, action: str, data: Dict) -> None:
-        message = json.dumps({"action": action, "data": data})
+    async def _send_event_to_control(self, event_type: str, payload: Dict) -> None:
+        message = json.dumps({"type": event_type, "payload": payload})
         if self.mode == BRIDGE_WS:
             await self._forward_to_control_ws(message)
         else:
