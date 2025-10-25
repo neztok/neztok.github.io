@@ -165,11 +165,14 @@ const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 
 const TTS_RESULT_TIMEOUT_MS = 500;
 const SILENCE_FALLBACK_DELAY_MS = 120;
+const AUDIO_SYNC_WAIT_MS = 500;
+const PREFETCH_LOOKAHEAD = 1;
 
 let elements = {};
 let statusFrameToken = null;
 let userReadyResolvers = [];
 const pendingTtsRequests = new Map();
+const sentenceAudioCache = new Map();
 let flowController = null;
 let readyNotified = false;
 let playbackQueueTail = Promise.resolve();
@@ -250,6 +253,7 @@ function cancelFlowController(reason = 'cancelled') {
 function rejectPendingTts(reason) {
   const cause = reason || 'cancelled';
   if (!pendingTtsRequests.size) {
+    clearSentenceAudioCache(cause);
     return;
   }
   pendingTtsRequests.forEach((entry, key) => {
@@ -262,6 +266,93 @@ function rejectPendingTts(reason) {
       console.error('reject tts failed', err);
     }
   });
+  clearSentenceAudioCache(cause);
+}
+
+function sentenceCacheKey(seq, sentSeq) {
+  return `${seq}:${sentSeq}`;
+}
+
+function clearSentenceAudioCache(reason = 'clear') {
+  if (!sentenceAudioCache.size) {
+    return;
+  }
+  console.info(`audio cache cleared reason=${reason}`);
+  sentenceAudioCache.clear();
+}
+
+function ensureSentenceAudio(seq, sentSeq, options = {}) {
+  const key = sentenceCacheKey(seq, sentSeq);
+  const existing = sentenceAudioCache.get(key);
+  const mode = options.mode || 'playback';
+  if (existing) {
+    if (mode === 'playback' && existing.mode === 'prefetch' && !existing.promoted) {
+      existing.promoted = true;
+      existing.mode = 'playback';
+      console.info(`prefetch promote page_seq=${seq} sent_seq=${sentSeq}`);
+    }
+    return existing;
+  }
+  const requestId = createTtsRequestId(seq, state.pageIndex, sentSeq);
+  const startedAt = performance.now();
+  console.info(`${mode} request page_seq=${seq} sent_seq=${sentSeq}`);
+  const entry = {
+    requestId,
+    seq,
+    sentSeq,
+    mode,
+    promoted: mode !== 'prefetch',
+    createdAt: startedAt,
+  };
+  entry.promise = requestSentenceAudio({ seq, sentSeq, requestId, mode })
+    .then((chunks) => {
+      const waitMs = Math.round(performance.now() - startedAt);
+      console.info(`${mode} ready page_seq=${seq} sent_seq=${sentSeq}`, {
+        wait_ms: waitMs,
+        chunkCount: Array.isArray(chunks) ? chunks.length : 0,
+      });
+      return chunks;
+    })
+    .catch((err) => {
+      sentenceAudioCache.delete(key);
+      throw err;
+    });
+  sentenceAudioCache.set(key, entry);
+  return entry;
+}
+
+function prefetchSentences(seq, page, startIndex = 0) {
+  if (!Number.isFinite(seq) || seq <= 0) {
+    return;
+  }
+  if (seq < state.activeSeq) {
+    return;
+  }
+  if (!page || !Array.isArray(page.phrases) || page.phrases.length === 0) {
+    return;
+  }
+  const limit = Math.min(page.phrases.length, startIndex + PREFETCH_LOOKAHEAD + 1);
+  for (let idx = startIndex; idx < limit; idx += 1) {
+    const phrase = page.phrases[idx];
+    if (!phrase) {
+      continue;
+    }
+    const length = phrase.length || (phrase.end - phrase.start);
+    if (length <= 0) {
+      continue;
+    }
+    const sentSeq = idx + 1;
+    const key = sentenceCacheKey(seq, sentSeq);
+    const existed = sentenceAudioCache.has(key);
+    const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch' });
+    if (!existed) {
+      console.info(`prefetch queued page_seq=${seq} sent_seq=${sentSeq}`, {
+        preview: sentencePreview(page, phrase),
+      });
+    } else if (entry.mode === 'prefetch') {
+      console.debug(`prefetch reuse page_seq=${seq} sent_seq=${sentSeq}`);
+    }
+  }
 }
 
 function activateSequence(seq) {
@@ -656,21 +747,157 @@ function findBreak(fullText, start, end) {
   return end;
 }
 
-function computePhrases(text) {
-  const phrases = [];
+const HARD_SENTENCE_DELIMS = new Set(['。', '．', '.', '!', '?', '！', '？', '\n']);
+const WEAK_SENTENCE_DELIMS = new Set(['、', '，', ',', '・', '･', ';', '；', ':', '：', '…', '‥']);
+const BRACKET_PAIRS = new Map([
+  ['(', ')'],
+  ['（', '）'],
+  ['「', '」'],
+  ['『', '』'],
+  ['[', ']'],
+  ['［', '］'],
+  ['｛', '｝'],
+  ['{', '}'],
+  ['〈', '〉'],
+  ['《', '》'],
+  ['【', '】'],
+  ['〔', '〕'],
+]);
+
+const SECONDARY_TRIGGER = 140;
+const SECONDARY_MAX = 160;
+const SECONDARY_MIN = 40;
+
+function computeBracketDepths(text) {
+  const depth = new Array(text.length).fill(0);
+  const closers = new Map();
+  BRACKET_PAIRS.forEach((close, open) => {
+    closers.set(close, open);
+  });
+  const stack = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (closers.has(char)) {
+      let idx = stack.length - 1;
+      while (idx >= 0 && stack[idx] !== char) {
+        stack.pop();
+        idx -= 1;
+      }
+      if (idx >= 0) {
+        stack.splice(idx, 1);
+      }
+    }
+    depth[i] = stack.length;
+    if (BRACKET_PAIRS.has(char)) {
+      stack.push(BRACKET_PAIRS.get(char));
+    }
+  }
+  return depth;
+}
+
+function splitPrimarySentences(text) {
+  const segments = [];
   let start = 0;
   for (let i = 0; i < text.length; i += 1) {
     const char = text[i];
-    if ('。．!?！？\n'.includes(char)) {
-      phrases.push({ start, end: i + 1 });
-      start = i + 1;
+    if (!HARD_SENTENCE_DELIMS.has(char)) {
+      continue;
+    }
+    const end = i + 1;
+    if (end > start) {
+      segments.push({ start, end });
+    }
+    start = end;
+    while (start < text.length && text[start] === '\n') {
+      start += 1;
+    }
+    if (start > i + 1) {
+      i = start - 1;
     }
   }
   if (start < text.length) {
-    phrases.push({ start, end: text.length });
+    segments.push({ start, end: text.length });
   }
+  return segments;
+}
+
+function splitLongSentence(text, start, end, depths) {
+  const parts = [];
+  let cursor = start;
+  while (cursor < end) {
+    const remaining = end - cursor;
+    if (remaining <= SECONDARY_MAX) {
+      parts.push({ start: cursor, end });
+      break;
+    }
+    const searchEnd = Math.min(end, cursor + SECONDARY_MAX);
+    const searchStart = Math.min(end, cursor + SECONDARY_TRIGGER);
+    let cut = -1;
+    for (let idx = searchEnd - 1; idx >= searchStart; idx -= 1) {
+      if (depths[idx] !== 0) {
+        continue;
+      }
+      if (!WEAK_SENTENCE_DELIMS.has(text[idx])) {
+        continue;
+      }
+      if (idx + 1 - cursor < SECONDARY_MIN) {
+        continue;
+      }
+      cut = idx + 1;
+      break;
+    }
+    if (cut === -1) {
+      for (let idx = searchEnd - 1; idx > cursor + SECONDARY_MIN; idx -= 1) {
+        if (depths[idx] !== 0) {
+          continue;
+        }
+        if (/\s/.test(text[idx])) {
+          cut = idx + 1;
+          break;
+        }
+      }
+    }
+    if (cut === -1 || cut <= cursor) {
+      cut = Math.min(end, cursor + SECONDARY_MAX);
+    }
+    parts.push({ start: cursor, end: cut });
+    cursor = cut;
+  }
+  return parts;
+}
+
+function computePhrases(text) {
+  if (!text) {
+    return [{ start: 0, end: 0, length: 0 }];
+  }
+  const depths = computeBracketDepths(text);
+  const primary = splitPrimarySentences(text);
+  const phrases = [];
+  primary.forEach((segment) => {
+    let { start, end } = segment;
+    while (start < end && /[\s\t\r]/.test(text[start])) {
+      start += 1;
+    }
+    while (end > start && /[\s\t\r]/.test(text[end - 1])) {
+      end -= 1;
+    }
+    if (end <= start) {
+      return;
+    }
+    const length = end - start;
+    if (length > SECONDARY_TRIGGER) {
+      const splits = splitLongSentence(text, start, end, depths);
+      splits.forEach((piece) => {
+        if (piece.end > piece.start) {
+          phrases.push({ start: piece.start, end: piece.end, length: piece.end - piece.start });
+        }
+      });
+    } else {
+      phrases.push({ start, end, length });
+    }
+  });
   if (!phrases.length) {
-    phrases.push({ start: 0, end: text.length });
+    phrases.push({ start: 0, end: text.length, length: text.length });
   }
   return phrases;
 }
@@ -829,12 +1056,14 @@ function updateScroll(page) {
 }
 
 function resetPlaybackState(options = {}) {
-  const { flushAudio = false, resetIndex = true } = options;
+  const { flushAudio = false, resetIndex = true, preserveAudioCache = false } = options;
   cancelFlowController('reset');
   if (flushAudio) {
     audioManager.flush();
   }
-  rejectPendingTts('reset');
+  if (!preserveAudioCache) {
+    rejectPendingTts('reset');
+  }
   if (resetIndex) {
     state.phraseIndex = 0;
   }
@@ -858,21 +1087,14 @@ function settleTtsPromise(requestId, callback) {
   }
 }
 
-function requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }) {
+function requestSentenceAudio({ seq, sentSeq, requestId, mode }) {
   return new Promise((resolve, reject) => {
     registerTtsPromise(requestId, seq, sentSeq, resolve, reject);
     sendEvent('TTS_REQUEST', {
       seq,
       sentSeq,
       requestId,
-      slice: [
-        {
-          id: requestId,
-          startChar,
-          endChar,
-          sentSeq,
-        },
-      ],
+      mode,
     }, { seq });
   });
 }
@@ -988,29 +1210,62 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
     page_seq: seq,
     text: sentencePreview(page, phrase),
   });
-  const requestId = createTtsRequestId(seq, state.pageIndex, sentSeq);
-  const startChar = page.start + computeSentenceStart(page, phrase);
-  const endChar = page.start + computeSentenceEnd(page, phrase);
-  const ttsPromise = requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }).catch((err) => {
-    console.error('tts request failed', err);
-    return [];
+  const sentenceStart = computeSentenceStart(page, phrase);
+  const sentenceEnd = computeSentenceEnd(page, phrase);
+  const absoluteStart = page.start + sentenceStart;
+  const absoluteEnd = page.start + sentenceEnd;
+  const cacheKey = sentenceCacheKey(seq, sentSeq);
+  const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'playback' });
+  const ttsPromise = entry.promise.catch((err) => {
+    const reason = err && err.message ? err.message : '';
+    if (!['cancelled', 'sequence-changed', 'stopped', 'reset'].includes(reason)) {
+      console.error('tts request failed', err);
+    }
+    throw err;
   });
-  try {
-    await typewriter.revealTo(page, computeSentenceEnd(page, phrase), flow);
-  } catch (err) {
-    return false;
+  if (state.typedLength > sentenceStart) {
+    state.typedLength = sentenceStart;
+    setDisplayedText(page, state.typedLength);
   }
-  state.typedLength = Math.max(state.typedLength, computeSentenceEnd(page, phrase));
-  setDisplayedText(page, state.typedLength);
+  if (state.typedLength < sentenceStart) {
+    state.typedLength = sentenceStart;
+    setDisplayedText(page, state.typedLength);
+  }
   updateScroll(page);
-  if (!isFlowActive(flow)) {
-    return false;
+  console.info(`display start page_seq=${seq} sent_seq=${sentSeq}`, {
+    start: absoluteStart,
+    end: absoluteEnd,
+  });
+  let readyChunks = null;
+  let audioReady = false;
+  try {
+    const syncResult = await Promise.race([
+      Promise.resolve(ttsPromise).then((chunks) => ({ type: 'ready', chunks })),
+      delay(AUDIO_SYNC_WAIT_MS).then(() => ({ type: 'timeout' })),
+    ]);
+    if (syncResult && syncResult.type === 'ready') {
+      readyChunks = Array.isArray(syncResult.chunks) ? syncResult.chunks : [];
+      audioReady = true;
+    }
+  } catch (err) {
+    console.error('audio sync wait failed', err);
   }
+  const typePromise = typewriter.revealTo(page, sentenceEnd, flow);
   playbackQueue.enqueue(async () => {
     if (!isFlowActive(flow)) {
       return;
     }
-    const { chunks, timeout } = await resolveTtsWithTimeout(ttsPromise, { seq, sentSeq });
+    let chunks = readyChunks;
+    let timeout = false;
+    if (!chunks) {
+      const resolved = await resolveTtsWithTimeout(ttsPromise, { seq, sentSeq });
+      chunks = resolved.chunks;
+      timeout = resolved.timeout;
+    } else {
+      console.info(`tts cached page_seq=${seq} sent_seq=${sentSeq}`, {
+        wait_ms: Math.round(performance.now() - (entry.createdAt || performance.now())),
+      });
+    }
     if (!isFlowActive(flow)) {
       return;
     }
@@ -1023,9 +1278,10 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
         const elapsed = Math.round(performance.now() - started);
         console.info(`play end page_seq=${seq} sent_seq=${sentSeq}`, { dur_ms: elapsed });
       }
-    } else if (timeout) {
-      console.info(`play skip page_seq=${seq} sent_seq=${sentSeq}`, { reason: 'timeout' });
-      if (SILENCE_FALLBACK_DELAY_MS > 0) {
+    } else if (timeout || !audioReady) {
+      const reason = timeout ? 'timeout' : 'no_audio';
+      console.info(`play skip page_seq=${seq} sent_seq=${sentSeq}`, { reason });
+      if (timeout && SILENCE_FALLBACK_DELAY_MS > 0) {
         await delay(SILENCE_FALLBACK_DELAY_MS);
       }
     } else {
@@ -1036,7 +1292,21 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
     }
     state.phraseIndex = sentenceIndex + 1;
     scheduleStatus();
+    sentenceAudioCache.delete(cacheKey);
   });
+  try {
+    await typePromise;
+    console.info(`display end page_seq=${seq} sent_seq=${sentSeq}`);
+  } catch (err) {
+    return false;
+  }
+  state.typedLength = Math.max(state.typedLength, sentenceEnd);
+  setDisplayedText(page, state.typedLength);
+  updateScroll(page);
+  if (!isFlowActive(flow)) {
+    return false;
+  }
+  prefetchSentences(seq, page, sentenceIndex + 1);
   return true;
 }
 
@@ -1056,6 +1326,7 @@ async function runPresentationFlow(startSentence = 0) {
   }
   state.phraseIndex = Math.max(0, Math.min(startSentence, page.phrases.length));
   const playbackQueue = createPlaybackQueue(flow);
+  prefetchSentences(seq, page, state.phraseIndex);
   for (let index = startSentence; index < page.phrases.length; index += 1) {
     if (!isFlowActive(flow)) {
       return;
@@ -1430,7 +1701,10 @@ async function setPage(index, options = {}) {
   typewriter.stop();
   state.typedLength = 0;
   state.phraseIndex = 0;
-  resetPlaybackState({ flushAudio: options.flushAudio !== false });
+  resetPlaybackState({
+    flushAudio: options.flushAudio !== false,
+    preserveAudioCache: Boolean(options.preserveAudioCache),
+  });
   if (elements.content) {
     elements.content.textContent = '';
   }
@@ -1491,9 +1765,18 @@ const handlers = {
     scheduleStatus();
     const page = currentPage();
     const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const sentences = phrases.map((phrase, idx) => ({
+      start: page.start + computeSentenceStart(page, phrase),
+      end: page.start + computeSentenceEnd(page, phrase),
+      length: phrase.length || (phrase.end - phrase.start),
+      sentSeq: idx + 1,
+    }));
+    const lengths = sentences.map((item) => item.length);
     const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
-    console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: phrases.length });
-    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: pageSeq });
+    console.info(`split result page_seq=${pageSeq}`, { count: sentences.length, lengths });
+    console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: sentences.length });
+    sendEvent('SENTENCES_READY', { count: sentences.length, samples, sentences, lengths }, { seq: pageSeq });
+    prefetchSentences(pageSeq, page, 0);
   },
 
   async START(data = {}, seq) {
@@ -1503,7 +1786,12 @@ const handlers = {
     const active = state.activeSeq;
     console.info(`rx START page_seq=${active}`);
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
-    await setPage(fromPage, { flushAudio: true });
+    const needsReset = fromPage !== state.pageIndex;
+    await setPage(fromPage, {
+      flushAudio: needsReset,
+      preserveAudioCache: !needsReset,
+    });
+    prefetchSentences(state.activeSeq, currentPage(), 0);
     await waitForUserReady();
     if (active !== state.activeSeq) {
       return;
@@ -1512,6 +1800,7 @@ const handlers = {
     if (!page) {
       return;
     }
+    prefetchSentences(state.activeSeq, page, 0);
     state.phraseIndex = 0;
     state.typedLength = 0;
     setDisplayedText(page, 0);
@@ -1566,9 +1855,18 @@ const handlers = {
     setStatusHint(`ページ ${state.pageIndex + 1}`);
     const page = currentPage();
     const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const sentences = phrases.map((phrase, idx) => ({
+      start: page.start + computeSentenceStart(page, phrase),
+      end: page.start + computeSentenceEnd(page, phrase),
+      length: phrase.length || (phrase.end - phrase.start),
+      sentSeq: idx + 1,
+    }));
+    const lengths = sentences.map((item) => item.length);
     const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
-    console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: phrases.length });
-    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: state.activeSeq });
+    console.info(`split result page_seq=${state.activeSeq}`, { count: sentences.length, lengths });
+    console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: sentences.length });
+    sendEvent('SENTENCES_READY', { count: sentences.length, samples, sentences, lengths }, { seq: state.activeSeq });
+    prefetchSentences(state.activeSeq, page, 0);
   },
 
   SET_CPS(data = {}, seq) {
