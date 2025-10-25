@@ -159,20 +159,42 @@ const state = {
   connectionStage: 'disconnected',
   readyByUser: false,
   activeSeq: 0,
+  preload: {
+    status: 'idle',
+    seq: 0,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    active: 0,
+    currentSentSeq: 0,
+    currentPreview: '',
+    startedAt: 0,
+    message: '',
+    promise: null,
+    slowWarning: false,
+    allowForce: false,
+  },
 };
 
 const FONT_SCALES = [1, 26 / 28, 24 / 28, 22 / 28];
 
 const TTS_RESULT_TIMEOUT_MS = 500;
 const SILENCE_FALLBACK_DELAY_MS = 120;
+const AUDIO_SYNC_WAIT_MS = 500;
+const PRELOAD_TIMEOUT_MS = 5000;
+const PRELOAD_MAX_RETRIES = 1;
+const PRELOAD_CONCURRENCY = 3;
+const PRELOAD_GLOBAL_FACTOR = 0.6;
 
 let elements = {};
 let statusFrameToken = null;
 let userReadyResolvers = [];
 const pendingTtsRequests = new Map();
+const sentenceAudioCache = new Map();
 let flowController = null;
 let readyNotified = false;
 let playbackQueueTail = Promise.resolve();
+let preloadController = null;
 
 const CONNECTION_LABELS = {
   disconnected: '未接続',
@@ -250,6 +272,7 @@ function cancelFlowController(reason = 'cancelled') {
 function rejectPendingTts(reason) {
   const cause = reason || 'cancelled';
   if (!pendingTtsRequests.size) {
+    clearSentenceAudioCache(cause);
     return;
   }
   pendingTtsRequests.forEach((entry, key) => {
@@ -262,6 +285,377 @@ function rejectPendingTts(reason) {
       console.error('reject tts failed', err);
     }
   });
+  clearSentenceAudioCache(cause);
+}
+
+function sentenceCacheKey(seq, sentSeq) {
+  return `${seq}:${sentSeq}`;
+}
+
+function clearSentenceAudioCache(reason = 'clear') {
+  if (!sentenceAudioCache.size) {
+    return;
+  }
+  console.info(`audio cache cleared reason=${reason}`);
+  sentenceAudioCache.clear();
+}
+
+function ensureSentenceAudio(seq, sentSeq, options = {}) {
+  const key = sentenceCacheKey(seq, sentSeq);
+  const mode = options.mode || 'playback';
+  const refresh = Boolean(options.refresh);
+  if (refresh) {
+    sentenceAudioCache.delete(key);
+  }
+  const existing = sentenceAudioCache.get(key);
+  if (existing) {
+    if (mode === 'playback' && existing.mode === 'prefetch' && !existing.promoted) {
+      existing.promoted = true;
+      existing.mode = 'playback';
+      console.info(`prefetch promote page_seq=${seq} sent_seq=${sentSeq}`);
+    }
+    return existing;
+  }
+  const requestId = createTtsRequestId(seq, state.pageIndex, sentSeq);
+  const startedAt = performance.now();
+  console.info(`${mode} request page_seq=${seq} sent_seq=${sentSeq}`);
+  const entry = {
+    requestId,
+    seq,
+    sentSeq,
+    mode,
+    promoted: mode !== 'prefetch',
+    createdAt: startedAt,
+  };
+  entry.promise = requestSentenceAudio({ seq, sentSeq, requestId, mode })
+    .then((chunks) => {
+      const waitMs = Math.round(performance.now() - startedAt);
+      console.info(`${mode} ready page_seq=${seq} sent_seq=${sentSeq}`, {
+        wait_ms: waitMs,
+        chunkCount: Array.isArray(chunks) ? chunks.length : 0,
+      });
+      return chunks;
+    })
+    .catch((err) => {
+      sentenceAudioCache.delete(key);
+      throw err;
+    });
+  sentenceAudioCache.set(key, entry);
+  return entry;
+}
+
+function resetPreloadState(overrides = {}) {
+  state.preload = {
+    status: 'idle',
+    seq: 0,
+    total: 0,
+    completed: 0,
+    failed: 0,
+    active: 0,
+    currentSentSeq: 0,
+    currentPreview: '',
+    startedAt: 0,
+    message: '',
+    promise: null,
+    slowWarning: false,
+    allowForce: false,
+    ...overrides,
+  };
+  updatePreloadUI();
+}
+
+function cancelPreloading(reason = 'cancelled') {
+  if (preloadController && preloadController.controller && !preloadController.controller.signal.aborted) {
+    try {
+      preloadController.controller.abort();
+    } catch (err) {
+      console.error('preload abort failed', err);
+    }
+    console.info(`preload cancel page_seq=${preloadController.seq}`, { reason });
+  }
+  preloadController = null;
+}
+
+function computePreloadPercent(info) {
+  if (!info || !info.total) {
+    return info && info.status === 'done' ? 100 : 0;
+  }
+  const processed = Math.min(info.total, info.completed + info.failed);
+  return Math.max(0, Math.min(100, Math.round((processed / info.total) * 100)));
+}
+
+function currentPreloadSeq() {
+  return state.preload && state.preload.seq ? state.preload.seq : state.activeSeq;
+}
+
+function notifyPreloadStatus(overrides = {}) {
+  const info = state.preload || {};
+  const payload = {
+    status: info.status || 'idle',
+    total: info.total || 0,
+    completed: info.completed || 0,
+    failed: info.failed || 0,
+    active: info.active || 0,
+    percent: computePreloadPercent(info),
+    currentSentSeq: info.currentSentSeq || 0,
+    preview: info.currentPreview || '',
+    message: info.message || '',
+    allowForce: Boolean(info.allowForce),
+    elapsedMs: info.startedAt ? Math.round(performance.now() - info.startedAt) : 0,
+    seq: currentPreloadSeq(),
+    ...overrides,
+  };
+  console.info(`preload status page_seq=${payload.seq}`, payload);
+  sendEvent('PRELOAD_STATUS', payload, { seq: payload.seq });
+}
+
+function updatePreloadUI() {
+  if (!elements.preloadStatus) {
+    return;
+  }
+  const info = state.preload || {};
+  const visible = info.status === 'running' || info.status === 'failed';
+  elements.preloadStatus.classList.toggle('hidden', !visible);
+  const percent = computePreloadPercent(info);
+  if (elements.preloadBarFill) {
+    elements.preloadBarFill.style.width = `${percent}%`;
+  }
+  if (elements.preloadPercent) {
+    elements.preloadPercent.textContent = `${percent}%`;
+  }
+  if (elements.preloadCount) {
+    const total = info.total || 0;
+    const processed = Math.min(total, info.completed + info.failed);
+    elements.preloadCount.textContent = `${processed}/${total}`;
+  }
+  if (elements.preloadPreview) {
+    if (info.currentSentSeq && info.currentPreview) {
+      elements.preloadPreview.textContent = `現在: 「${info.currentPreview}」`;
+    } else {
+      elements.preloadPreview.textContent = '';
+    }
+  }
+  if (elements.preloadMessage) {
+    elements.preloadMessage.textContent = info.message || '';
+  }
+  if (elements.preloadForceButton) {
+    const showForce = info.status === 'failed' && info.failed > 0;
+    elements.preloadForceButton.classList.toggle('hidden', !showForce);
+    elements.preloadForceButton.disabled = !showForce;
+  }
+}
+
+async function waitForPreloadCompletion({ force = false } = {}) {
+  const info = state.preload;
+  if (!info || !info.promise) {
+    return;
+  }
+  if (force) {
+    cancelPreloading('forced_start');
+    return;
+  }
+  if (info.status === 'running') {
+    try {
+      await info.promise;
+    } catch (err) {
+      console.warn('preload wait failed', err);
+    }
+  }
+}
+
+function markPreloadFailure(info, sentSeq, reason) {
+  info.failed += 1;
+  info.message = `${info.failed}文失敗（無音再生）`;
+  info.allowForce = true;
+  console.warn(`preload failed page_seq=${info.seq} sent_seq=${sentSeq}`, { reason });
+}
+
+function markPreloadSuccess(info) {
+  if (info.failed > 0) {
+    info.status = 'failed';
+    info.allowForce = true;
+  } else {
+    info.status = 'done';
+    info.allowForce = false;
+    info.message = '';
+  }
+  updatePreloadUI();
+  notifyPreloadStatus();
+}
+
+function raceWithTimeout(promise, timeoutMs, signal) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (signal && abortHandler) {
+        signal.removeEventListener('abort', abortHandler);
+      }
+    };
+    const finish = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const abortHandler = () => finish({ type: 'aborted' });
+    if (signal) {
+      if (signal.aborted) {
+        finish({ type: 'aborted' });
+        return;
+      }
+      signal.addEventListener('abort', abortHandler, { once: true });
+    }
+    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+      timer = setTimeout(() => finish({ type: 'timeout' }), timeoutMs);
+    }
+    Promise.resolve(promise)
+      .then((value) => finish({ type: 'value', value }))
+      .catch((error) => finish({ type: 'error', error }));
+  });
+}
+
+async function startPreloading(seq, page) {
+  cancelPreloading('restart');
+  if (!page || !Array.isArray(page.phrases)) {
+    resetPreloadState({ status: 'done', seq });
+    notifyPreloadStatus();
+    return;
+  }
+  const phrases = page.phrases.filter((phrase) => phrase && (phrase.length || (phrase.end - phrase.start) > 0));
+  const total = phrases.length;
+  const info = {
+    status: total ? 'running' : 'done',
+    seq,
+    total,
+    completed: 0,
+    failed: 0,
+    active: 0,
+    currentSentSeq: 0,
+    currentPreview: '',
+    startedAt: performance.now(),
+    message: total ? '音声を準備しています…' : '',
+    promise: null,
+    slowWarning: false,
+    allowForce: false,
+  };
+  state.preload = info;
+  updatePreloadUI();
+  notifyPreloadStatus();
+  if (!total) {
+    markPreloadSuccess(info);
+    return;
+  }
+  console.info(`preload start page_seq=${seq}`, { total, concurrency: PRELOAD_CONCURRENCY });
+  const controller = new AbortController();
+  preloadController = { controller, seq };
+  let cursor = 0;
+
+  const runJob = async (index) => {
+    if (controller.signal.aborted) {
+      return;
+    }
+    const phrase = phrases[index];
+    if (!phrase) {
+      return;
+    }
+    const sentSeq = index + 1;
+    const preview = sentencePreview(page, phrase);
+    info.active += 1;
+    info.currentSentSeq = sentSeq;
+    info.currentPreview = preview;
+    updatePreloadUI();
+    let attempt = 0;
+    let success = false;
+    let lastReason = '';
+    while (!success && attempt <= PRELOAD_MAX_RETRIES && !controller.signal.aborted) {
+      attempt += 1;
+      const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'prefetch', refresh: attempt > 1 });
+      const started = performance.now();
+      const outcome = await raceWithTimeout(entry.promise, PRELOAD_TIMEOUT_MS, controller.signal);
+      if (outcome.type === 'aborted') {
+        info.active = Math.max(0, info.active - 1);
+        return;
+      }
+      if (outcome.type === 'value') {
+        const chunks = Array.isArray(outcome.value) ? outcome.value : [];
+        const waitMs = Math.round(performance.now() - started);
+        if (chunks.length > 0) {
+          console.info(`preload success page_seq=${seq} sent_seq=${sentSeq}`, { wait_ms: waitMs, attempt });
+          success = true;
+        } else {
+          lastReason = 'empty_chunks';
+          sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+        }
+      } else if (outcome.type === 'timeout') {
+        lastReason = 'timeout';
+        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+      } else if (outcome.type === 'error') {
+        lastReason = outcome.error && outcome.error.message ? outcome.error.message : 'error';
+        sentenceAudioCache.delete(sentenceCacheKey(seq, sentSeq));
+      }
+    }
+    info.active = Math.max(0, info.active - 1);
+    if (success) {
+      info.completed += 1;
+    } else {
+      markPreloadFailure(info, sentSeq, lastReason || 'unknown');
+    }
+    info.currentSentSeq = 0;
+    info.currentPreview = '';
+    updatePreloadUI();
+    notifyPreloadStatus();
+  };
+
+  const workers = Array.from({ length: Math.min(PRELOAD_CONCURRENCY, total) }, async () => {
+    while (!controller.signal.aborted) {
+      const index = cursor;
+      cursor += 1;
+      if (index >= total) {
+        return;
+      }
+      await runJob(index);
+    }
+  });
+
+  const globalThreshold = total * PRELOAD_TIMEOUT_MS * PRELOAD_GLOBAL_FACTOR;
+
+  info.promise = Promise.all(workers)
+    .then(() => {
+      if (controller.signal.aborted) {
+        info.status = 'cancelled';
+        info.message = '';
+        updatePreloadUI();
+        notifyPreloadStatus({ status: 'cancelled' });
+        return;
+      }
+      markPreloadSuccess(info);
+    })
+    .finally(() => {
+      preloadController = null;
+    });
+
+  (async () => {
+    while (info.status === 'running') {
+      await delay(500);
+      if (info.status !== 'running') {
+        break;
+      }
+      const elapsed = performance.now() - info.startedAt;
+      if (!info.slowWarning && globalThreshold > 0 && elapsed > globalThreshold) {
+        info.slowWarning = true;
+        info.message = '通常より時間がかかっています';
+        updatePreloadUI();
+        notifyPreloadStatus();
+      }
+    }
+  })();
 }
 
 function activateSequence(seq) {
@@ -656,21 +1050,157 @@ function findBreak(fullText, start, end) {
   return end;
 }
 
-function computePhrases(text) {
-  const phrases = [];
+const HARD_SENTENCE_DELIMS = new Set(['。', '．', '.', '!', '?', '！', '？', '\n']);
+const WEAK_SENTENCE_DELIMS = new Set(['、', '，', ',', '・', '･', ';', '；', ':', '：', '…', '‥']);
+const BRACKET_PAIRS = new Map([
+  ['(', ')'],
+  ['（', '）'],
+  ['「', '」'],
+  ['『', '』'],
+  ['[', ']'],
+  ['［', '］'],
+  ['｛', '｝'],
+  ['{', '}'],
+  ['〈', '〉'],
+  ['《', '》'],
+  ['【', '】'],
+  ['〔', '〕'],
+]);
+
+const SECONDARY_TRIGGER = 140;
+const SECONDARY_MAX = 160;
+const SECONDARY_MIN = 40;
+
+function computeBracketDepths(text) {
+  const depth = new Array(text.length).fill(0);
+  const closers = new Map();
+  BRACKET_PAIRS.forEach((close, open) => {
+    closers.set(close, open);
+  });
+  const stack = [];
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (closers.has(char)) {
+      let idx = stack.length - 1;
+      while (idx >= 0 && stack[idx] !== char) {
+        stack.pop();
+        idx -= 1;
+      }
+      if (idx >= 0) {
+        stack.splice(idx, 1);
+      }
+    }
+    depth[i] = stack.length;
+    if (BRACKET_PAIRS.has(char)) {
+      stack.push(BRACKET_PAIRS.get(char));
+    }
+  }
+  return depth;
+}
+
+function splitPrimarySentences(text) {
+  const segments = [];
   let start = 0;
   for (let i = 0; i < text.length; i += 1) {
     const char = text[i];
-    if ('。．!?！？\n'.includes(char)) {
-      phrases.push({ start, end: i + 1 });
-      start = i + 1;
+    if (!HARD_SENTENCE_DELIMS.has(char)) {
+      continue;
+    }
+    const end = i + 1;
+    if (end > start) {
+      segments.push({ start, end });
+    }
+    start = end;
+    while (start < text.length && text[start] === '\n') {
+      start += 1;
+    }
+    if (start > i + 1) {
+      i = start - 1;
     }
   }
   if (start < text.length) {
-    phrases.push({ start, end: text.length });
+    segments.push({ start, end: text.length });
   }
+  return segments;
+}
+
+function splitLongSentence(text, start, end, depths) {
+  const parts = [];
+  let cursor = start;
+  while (cursor < end) {
+    const remaining = end - cursor;
+    if (remaining <= SECONDARY_MAX) {
+      parts.push({ start: cursor, end });
+      break;
+    }
+    const searchEnd = Math.min(end, cursor + SECONDARY_MAX);
+    const searchStart = Math.min(end, cursor + SECONDARY_TRIGGER);
+    let cut = -1;
+    for (let idx = searchEnd - 1; idx >= searchStart; idx -= 1) {
+      if (depths[idx] !== 0) {
+        continue;
+      }
+      if (!WEAK_SENTENCE_DELIMS.has(text[idx])) {
+        continue;
+      }
+      if (idx + 1 - cursor < SECONDARY_MIN) {
+        continue;
+      }
+      cut = idx + 1;
+      break;
+    }
+    if (cut === -1) {
+      for (let idx = searchEnd - 1; idx > cursor + SECONDARY_MIN; idx -= 1) {
+        if (depths[idx] !== 0) {
+          continue;
+        }
+        if (/\s/.test(text[idx])) {
+          cut = idx + 1;
+          break;
+        }
+      }
+    }
+    if (cut === -1 || cut <= cursor) {
+      cut = Math.min(end, cursor + SECONDARY_MAX);
+    }
+    parts.push({ start: cursor, end: cut });
+    cursor = cut;
+  }
+  return parts;
+}
+
+function computePhrases(text) {
+  if (!text) {
+    return [{ start: 0, end: 0, length: 0 }];
+  }
+  const depths = computeBracketDepths(text);
+  const primary = splitPrimarySentences(text);
+  const phrases = [];
+  primary.forEach((segment) => {
+    let { start, end } = segment;
+    while (start < end && /[\s\t\r]/.test(text[start])) {
+      start += 1;
+    }
+    while (end > start && /[\s\t\r]/.test(text[end - 1])) {
+      end -= 1;
+    }
+    if (end <= start) {
+      return;
+    }
+    const length = end - start;
+    if (length > SECONDARY_TRIGGER) {
+      const splits = splitLongSentence(text, start, end, depths);
+      splits.forEach((piece) => {
+        if (piece.end > piece.start) {
+          phrases.push({ start: piece.start, end: piece.end, length: piece.end - piece.start });
+        }
+      });
+    } else {
+      phrases.push({ start, end, length });
+    }
+  });
   if (!phrases.length) {
-    phrases.push({ start: 0, end: text.length });
+    phrases.push({ start: 0, end: text.length, length: text.length });
   }
   return phrases;
 }
@@ -829,12 +1359,14 @@ function updateScroll(page) {
 }
 
 function resetPlaybackState(options = {}) {
-  const { flushAudio = false, resetIndex = true } = options;
+  const { flushAudio = false, resetIndex = true, preserveAudioCache = false } = options;
   cancelFlowController('reset');
   if (flushAudio) {
     audioManager.flush();
   }
-  rejectPendingTts('reset');
+  if (!preserveAudioCache) {
+    rejectPendingTts('reset');
+  }
   if (resetIndex) {
     state.phraseIndex = 0;
   }
@@ -858,21 +1390,14 @@ function settleTtsPromise(requestId, callback) {
   }
 }
 
-function requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }) {
+function requestSentenceAudio({ seq, sentSeq, requestId, mode }) {
   return new Promise((resolve, reject) => {
     registerTtsPromise(requestId, seq, sentSeq, resolve, reject);
     sendEvent('TTS_REQUEST', {
       seq,
       sentSeq,
       requestId,
-      slice: [
-        {
-          id: requestId,
-          startChar,
-          endChar,
-          sentSeq,
-        },
-      ],
+      mode,
     }, { seq });
   });
 }
@@ -988,29 +1513,62 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
     page_seq: seq,
     text: sentencePreview(page, phrase),
   });
-  const requestId = createTtsRequestId(seq, state.pageIndex, sentSeq);
-  const startChar = page.start + computeSentenceStart(page, phrase);
-  const endChar = page.start + computeSentenceEnd(page, phrase);
-  const ttsPromise = requestSentenceAudio({ seq, sentSeq, requestId, startChar, endChar }).catch((err) => {
-    console.error('tts request failed', err);
-    return [];
+  const sentenceStart = computeSentenceStart(page, phrase);
+  const sentenceEnd = computeSentenceEnd(page, phrase);
+  const absoluteStart = page.start + sentenceStart;
+  const absoluteEnd = page.start + sentenceEnd;
+  const cacheKey = sentenceCacheKey(seq, sentSeq);
+  const entry = ensureSentenceAudio(seq, sentSeq, { mode: 'playback' });
+  const ttsPromise = entry.promise.catch((err) => {
+    const reason = err && err.message ? err.message : '';
+    if (!['cancelled', 'sequence-changed', 'stopped', 'reset'].includes(reason)) {
+      console.error('tts request failed', err);
+    }
+    throw err;
   });
-  try {
-    await typewriter.revealTo(page, computeSentenceEnd(page, phrase), flow);
-  } catch (err) {
-    return false;
+  if (state.typedLength > sentenceStart) {
+    state.typedLength = sentenceStart;
+    setDisplayedText(page, state.typedLength);
   }
-  state.typedLength = Math.max(state.typedLength, computeSentenceEnd(page, phrase));
-  setDisplayedText(page, state.typedLength);
+  if (state.typedLength < sentenceStart) {
+    state.typedLength = sentenceStart;
+    setDisplayedText(page, state.typedLength);
+  }
   updateScroll(page);
-  if (!isFlowActive(flow)) {
-    return false;
+  console.info(`display start page_seq=${seq} sent_seq=${sentSeq}`, {
+    start: absoluteStart,
+    end: absoluteEnd,
+  });
+  let readyChunks = null;
+  let audioReady = false;
+  try {
+    const syncResult = await Promise.race([
+      Promise.resolve(ttsPromise).then((chunks) => ({ type: 'ready', chunks })),
+      delay(AUDIO_SYNC_WAIT_MS).then(() => ({ type: 'timeout' })),
+    ]);
+    if (syncResult && syncResult.type === 'ready') {
+      readyChunks = Array.isArray(syncResult.chunks) ? syncResult.chunks : [];
+      audioReady = true;
+    }
+  } catch (err) {
+    console.error('audio sync wait failed', err);
   }
+  const typePromise = typewriter.revealTo(page, sentenceEnd, flow);
   playbackQueue.enqueue(async () => {
     if (!isFlowActive(flow)) {
       return;
     }
-    const { chunks, timeout } = await resolveTtsWithTimeout(ttsPromise, { seq, sentSeq });
+    let chunks = readyChunks;
+    let timeout = false;
+    if (!chunks) {
+      const resolved = await resolveTtsWithTimeout(ttsPromise, { seq, sentSeq });
+      chunks = resolved.chunks;
+      timeout = resolved.timeout;
+    } else {
+      console.info(`tts cached page_seq=${seq} sent_seq=${sentSeq}`, {
+        wait_ms: Math.round(performance.now() - (entry.createdAt || performance.now())),
+      });
+    }
     if (!isFlowActive(flow)) {
       return;
     }
@@ -1023,9 +1581,10 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
         const elapsed = Math.round(performance.now() - started);
         console.info(`play end page_seq=${seq} sent_seq=${sentSeq}`, { dur_ms: elapsed });
       }
-    } else if (timeout) {
-      console.info(`play skip page_seq=${seq} sent_seq=${sentSeq}`, { reason: 'timeout' });
-      if (SILENCE_FALLBACK_DELAY_MS > 0) {
+    } else if (timeout || !audioReady) {
+      const reason = timeout ? 'timeout' : 'no_audio';
+      console.info(`play skip page_seq=${seq} sent_seq=${sentSeq}`, { reason });
+      if (timeout && SILENCE_FALLBACK_DELAY_MS > 0) {
         await delay(SILENCE_FALLBACK_DELAY_MS);
       }
     } else {
@@ -1036,7 +1595,20 @@ async function processSentence(flow, page, sentenceIndex, playbackQueue) {
     }
     state.phraseIndex = sentenceIndex + 1;
     scheduleStatus();
+    sentenceAudioCache.delete(cacheKey);
   });
+  try {
+    await typePromise;
+    console.info(`display end page_seq=${seq} sent_seq=${sentSeq}`);
+  } catch (err) {
+    return false;
+  }
+  state.typedLength = Math.max(state.typedLength, sentenceEnd);
+  setDisplayedText(page, state.typedLength);
+  updateScroll(page);
+  if (!isFlowActive(flow)) {
+    return false;
+  }
   return true;
 }
 
@@ -1430,7 +2002,11 @@ async function setPage(index, options = {}) {
   typewriter.stop();
   state.typedLength = 0;
   state.phraseIndex = 0;
-  resetPlaybackState({ flushAudio: options.flushAudio !== false });
+  cancelPreloading('set_page');
+  resetPlaybackState({
+    flushAudio: options.flushAudio !== false,
+    preserveAudioCache: Boolean(options.preserveAudioCache),
+  });
   if (elements.content) {
     elements.content.textContent = '';
   }
@@ -1491,9 +2067,18 @@ const handlers = {
     scheduleStatus();
     const page = currentPage();
     const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const sentences = phrases.map((phrase, idx) => ({
+      start: page.start + computeSentenceStart(page, phrase),
+      end: page.start + computeSentenceEnd(page, phrase),
+      length: phrase.length || (phrase.end - phrase.start),
+      sentSeq: idx + 1,
+    }));
+    const lengths = sentences.map((item) => item.length);
     const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
-    console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: phrases.length });
-    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: pageSeq });
+    console.info(`split result page_seq=${pageSeq}`, { count: sentences.length, lengths });
+    console.info(`tx SENTENCES_READY page_seq=${pageSeq}`, { count: sentences.length });
+    sendEvent('SENTENCES_READY', { count: sentences.length, samples, sentences, lengths }, { seq: pageSeq });
+    await startPreloading(pageSeq, page);
   },
 
   async START(data = {}, seq) {
@@ -1502,11 +2087,32 @@ const handlers = {
     }
     const active = state.activeSeq;
     console.info(`rx START page_seq=${active}`);
+    const force = Boolean(data.force);
     const fromPage = Number.isInteger(data.fromPage) ? data.fromPage : state.pageIndex;
-    await setPage(fromPage, { flushAudio: true });
+    const needsReset = fromPage !== state.pageIndex;
+    await setPage(fromPage, {
+      flushAudio: needsReset,
+      preserveAudioCache: !needsReset,
+    });
     await waitForUserReady();
     if (active !== state.activeSeq) {
       return;
+    }
+    if (force) {
+      await waitForPreloadCompletion({ force: true });
+      if (state.preload) {
+        state.preload.status = 'forced';
+        state.preload.message = '';
+        state.preload.allowForce = false;
+        updatePreloadUI();
+        notifyPreloadStatus({ status: 'forced' });
+      }
+    } else {
+      await waitForPreloadCompletion();
+      if (state.preload && state.preload.status === 'failed') {
+        console.warn('START aborted because preload failed without force');
+        return;
+      }
     }
     const page = currentPage();
     if (!page) {
@@ -1566,9 +2172,18 @@ const handlers = {
     setStatusHint(`ページ ${state.pageIndex + 1}`);
     const page = currentPage();
     const phrases = page && Array.isArray(page.phrases) ? page.phrases : [];
+    const sentences = phrases.map((phrase, idx) => ({
+      start: page.start + computeSentenceStart(page, phrase),
+      end: page.start + computeSentenceEnd(page, phrase),
+      length: phrase.length || (phrase.end - phrase.start),
+      sentSeq: idx + 1,
+    }));
+    const lengths = sentences.map((item) => item.length);
     const samples = phrases.map((phrase) => sentencePreview(page, phrase)).slice(0, 5);
-    console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: phrases.length });
-    sendEvent('SENTENCES_READY', { count: phrases.length, samples }, { seq: state.activeSeq });
+    console.info(`split result page_seq=${state.activeSeq}`, { count: sentences.length, lengths });
+    console.info(`tx SENTENCES_READY page_seq=${state.activeSeq}`, { count: sentences.length });
+    sendEvent('SENTENCES_READY', { count: sentences.length, samples, sentences, lengths }, { seq: state.activeSeq });
+    await startPreloading(state.activeSeq, page);
   },
 
   SET_CPS(data = {}, seq) {
@@ -1709,12 +2324,29 @@ document.addEventListener('DOMContentLoaded', () => {
     answers: document.getElementById('answers'),
     explain: document.getElementById('explain'),
     connection: document.getElementById('connectionBadge'),
+    preloadStatus: document.getElementById('preloadStatus'),
+    preloadBarFill: document.getElementById('preloadBarFill'),
+    preloadPercent: document.getElementById('preloadPercent'),
+    preloadCount: document.getElementById('preloadCount'),
+    preloadPreview: document.getElementById('preloadPreview'),
+    preloadMessage: document.getElementById('preloadMessage'),
+    preloadForceButton: document.getElementById('preloadForceButton'),
   };
   applyZoom(state.zoom);
   setCompact(state.compact);
   updateSettingsHint();
   updateConnectionBadge();
   scheduleStatus();
+  if (elements.preloadForceButton) {
+    elements.preloadForceButton.addEventListener('click', () => {
+      if (!state.preload || state.preload.status !== 'failed') {
+        return;
+      }
+      console.info('preload force requested by presenter');
+      sendEvent('FORCE_START_REQUEST', { reason: 'presenter' }, { seq: currentPreloadSeq() });
+    });
+  }
+  updatePreloadUI();
 });
 
 window.addEventListener('error', (event) => {
