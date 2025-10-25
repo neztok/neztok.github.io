@@ -1073,7 +1073,11 @@ class QuizApp:
     def stop_presentation(self, reason: str) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("STOP_ALL", {"reason": reason}, seq=self.page_seq)
+        seq = self.page_seq
+        if seq in self.pending_start_requests:
+            logging.info("discard pending START for seq=%d due to STOP", seq)
+            self.pending_start_requests.discard(seq)
+        self.presenter.send("STOP_ALL", {"reason": reason}, seq=seq)
 
     def resume_presentation(self) -> None:
         if not self.presentation_ready:
