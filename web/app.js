@@ -1628,6 +1628,7 @@ async function runPresentationFlow(startSentence = 0) {
   }
   state.phraseIndex = Math.max(0, Math.min(startSentence, page.phrases.length));
   const playbackQueue = createPlaybackQueue(flow);
+  prefetchSentences(seq, page, state.phraseIndex);
   for (let index = startSentence; index < page.phrases.length; index += 1) {
     if (!isFlowActive(flow)) {
       return;
@@ -2118,6 +2119,7 @@ const handlers = {
     if (!page) {
       return;
     }
+    prefetchSentences(state.activeSeq, page, 0);
     state.phraseIndex = 0;
     state.typedLength = 0;
     setDisplayedText(page, 0);
