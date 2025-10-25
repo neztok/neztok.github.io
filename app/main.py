@@ -23,7 +23,7 @@ import requests
 
 VOICEVOX_URL = "http://127.0.0.1:50021"
 DEFAULT_SPEAKER = 1
-MAX_CHARS_PER_TTS = 30
+MAX_CHARS_PER_TTS = 150
 BRIDGE_WS = "ws"
 BRIDGE_HTTP = "http"
 
@@ -638,10 +638,11 @@ class QuizApp:
         self.page_seq = 0
         self.active_page_seq = 0
         self.pending_tts_jobs: Dict[int, int] = defaultdict(int)
+        self.sequence_sentences: Dict[int, List[Tuple[int, int]]] = {}
         self.pending_sequence_commands: Dict[int, List[Tuple[str, Dict]]] = {}
         self.awaiting_sentences: Set[int] = set()
         self.ready_sequences: Set[int] = set()
-        self.pending_start_requests: Set[int] = set()
+        self.pending_start_requests: Dict[int, bool] = {}
         self.pending_tts_lock = threading.Lock()
         self.user_ready = False
         self.cps_var = tk.IntVar(value=14)
@@ -654,6 +655,22 @@ class QuizApp:
         self.voicevox_var = tk.StringVar(value="未確認")
         self.bridge_var = tk.StringVar(value="未接続")
         self.answer_text = tk.StringVar(value="")
+        self.preload_progress = tk.DoubleVar(value=0.0)
+        self.preload_percent = tk.StringVar(value="0%")
+        self.preload_count = tk.StringVar(value="0/0")
+        self.preload_preview = tk.StringVar(value="")
+        self.preload_message = tk.StringVar(value="")
+        self.preload_state: Dict[str, object] = {
+            "seq": 0,
+            "status": "idle",
+            "total": 0,
+            "completed": 0,
+            "failed": 0,
+        }
+        self.preload_completed_sequences: Set[int] = set()
+        self.preload_failed_sequences: Set[int] = set()
+        self.start_button: Optional[ttk.Button] = None
+        self.force_start_button: Optional[ttk.Button] = None
         self.questions_listbox: Optional[tk.Listbox] = None
         self.presentation_ready = False
         self.closing = False
@@ -706,7 +723,7 @@ class QuizApp:
         self.pending_sequence_commands.pop(self.page_seq, None)
         self.awaiting_sentences.discard(self.page_seq)
         self.ready_sequences.discard(self.page_seq)
-        self.pending_start_requests.discard(self.page_seq)
+        self.pending_start_requests.pop(self.page_seq, None)
         logging.info("emit page_seq=<%d>", self.page_seq)
         return self.page_seq
 
@@ -717,12 +734,15 @@ class QuizApp:
                     count = self.pending_tts_jobs.pop(seq, 0)
                     if count:
                         logging.info("cancel all for page_seq=<%d> count=%d", seq, count)
+        for seq in list(self.sequence_sentences.keys()):
+            if seq < new_seq:
+                self.sequence_sentences.pop(seq, None)
         for seq in list(self.pending_sequence_commands.keys()):
             if seq < new_seq:
                 self.pending_sequence_commands.pop(seq, None)
         self.awaiting_sentences = {seq for seq in self.awaiting_sentences if seq >= new_seq}
         self.ready_sequences = {seq for seq in self.ready_sequences if seq >= new_seq}
-        self.pending_start_requests = {seq for seq in self.pending_start_requests if seq >= new_seq}
+        self.pending_start_requests = {seq: force for seq, force in self.pending_start_requests.items() if seq >= new_seq}
 
     def queue_sequence_commands(self, commands: List[Tuple[str, Dict]]) -> int:
         seq = self._next_page_seq()
@@ -737,6 +757,7 @@ class QuizApp:
         if requires_sentences:
             self.awaiting_sentences.add(seq)
             self.ready_sequences.discard(seq)
+            self._init_preload_tracking(seq)
         else:
             self.ready_sequences.add(seq)
         logging.info("emit PAGE_SEQ command seq=%d pending=%d", seq, len(prepared))
@@ -761,7 +782,15 @@ class QuizApp:
 
         button_frame = ttk.Frame(left)
         button_frame.pack(fill=tk.X, pady=4)
-        ttk.Button(button_frame, text="開始", command=self.start_presentation).pack(side=tk.LEFT, padx=2)
+        self.start_button = ttk.Button(button_frame, text="開始", command=self.start_presentation, state=tk.DISABLED)
+        self.start_button.pack(side=tk.LEFT, padx=2)
+        self.force_start_button = ttk.Button(
+            button_frame,
+            text="それでも開始",
+            command=self.force_start_presentation,
+            state=tk.DISABLED,
+        )
+        self.force_start_button.pack(side=tk.LEFT, padx=2)
         ttk.Button(button_frame, text="停止", command=lambda: self.stop_presentation("manual")).pack(side=tk.LEFT, padx=2)
         ttk.Button(button_frame, text="再開", command=self.resume_presentation).pack(side=tk.LEFT, padx=2)
         ttk.Button(button_frame, text="正解表示", command=self.reveal_answer).pack(side=tk.LEFT, padx=2)
@@ -803,10 +832,242 @@ class QuizApp:
         ttk.Label(status_frame, textvariable=self.queue_var).grid(row=3, column=1, sticky=tk.W)
         ttk.Label(status_frame, text="VOICEVOX").grid(row=4, column=0, sticky=tk.W)
         ttk.Label(status_frame, textvariable=self.voicevox_var).grid(row=4, column=1, sticky=tk.W)
+        ttk.Label(status_frame, text="プリロード").grid(row=5, column=0, sticky=tk.W)
+        ttk.Progressbar(status_frame, maximum=100, variable=self.preload_progress).grid(
+            row=5,
+            column=1,
+            sticky=tk.EW,
+            pady=(2, 0),
+        )
+        ttk.Label(status_frame, textvariable=self.preload_percent).grid(row=6, column=0, sticky=tk.W)
+        ttk.Label(status_frame, textvariable=self.preload_count).grid(row=6, column=1, sticky=tk.W)
+        ttk.Label(
+            status_frame,
+            textvariable=self.preload_preview,
+            wraplength=260,
+            justify=tk.LEFT,
+        ).grid(row=7, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
+        ttk.Label(
+            status_frame,
+            textvariable=self.preload_message,
+            wraplength=260,
+            justify=tk.LEFT,
+            foreground="#b35c00",
+        ).grid(row=8, column=0, columnspan=2, sticky=tk.W)
+
+        for col in range(2):
+            status_frame.columnconfigure(col, weight=1)
 
         answer_frame = ttk.LabelFrame(right, text="正解")
         answer_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
         ttk.Label(answer_frame, textvariable=self.answer_text, wraplength=260, justify=tk.LEFT).pack(fill=tk.BOTH, expand=True)
+
+    def _set_start_enabled(self, enabled: bool) -> None:
+        if self.start_button is None:
+            return
+        self.start_button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _set_force_start_enabled(self, enabled: bool) -> None:
+        if self.force_start_button is None:
+            return
+        self.force_start_button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+
+    def _init_preload_tracking(self, seq: int) -> None:
+        self.preload_state = {
+            "seq": seq,
+            "status": "pending",
+            "total": 0,
+            "completed": 0,
+            "failed": 0,
+            "allowForce": False,
+        }
+        self.preload_progress.set(0.0)
+        self.preload_percent.set("0%")
+        self.preload_count.set("0/0")
+        self.preload_preview.set("")
+        self.preload_message.set("音声準備中…")
+        self.preload_completed_sequences.discard(seq)
+        self.preload_failed_sequences.discard(seq)
+        self._set_start_enabled(False)
+        self._set_force_start_enabled(False)
+
+    def _update_preload_total(self, seq: int, total: int) -> None:
+        if self.preload_state.get("seq") != seq:
+            self.preload_state["seq"] = seq
+        self.preload_state["total"] = max(0, int(total))
+        if total <= 0:
+            self.preload_progress.set(0.0)
+            self.preload_percent.set("0%")
+            self.preload_count.set("0/0")
+        else:
+            self.preload_count.set(f"0/{int(total)}")
+            self.preload_percent.set("0%")
+            self.preload_progress.set(0.0)
+
+    def _update_preload_display(self, percent: int, completed: int, total: int, preview: str, message: str) -> None:
+        percent = max(0, min(100, int(percent)))
+        completed = max(0, int(completed))
+        total = max(0, int(total))
+        self.preload_progress.set(percent)
+        self.preload_percent.set(f"{percent}%")
+        self.preload_count.set(f"{completed}/{total}" if total else f"{completed}/0")
+        self.preload_preview.set(preview)
+        self.preload_message.set(message)
+
+    def _handle_preload_status(self, seq: Optional[int], payload: Dict[str, object]) -> None:
+        if seq is None:
+            return
+        status = str(payload.get("status") or "running")
+        if seq < self.active_page_seq:
+            logging.info("ignore stale preload status seq=%d status=%s", seq, status)
+            return
+        try:
+            total = int(payload.get("total", 0))
+        except (TypeError, ValueError):
+            total = 0
+        try:
+            completed = int(payload.get("completed", 0))
+        except (TypeError, ValueError):
+            completed = 0
+        try:
+            failed = int(payload.get("failed", 0))
+        except (TypeError, ValueError):
+            failed = 0
+        try:
+            percent = int(payload.get("percent", 0))
+        except (TypeError, ValueError):
+            percent = 0
+        processed = completed + failed
+        preview = str(payload.get("preview") or "")[:20]
+        message = str(payload.get("message") or "")
+        allow_force = bool(payload.get("allowForce"))
+        elapsed_ms = payload.get("elapsedMs")
+        current_sent_seq = payload.get("currentSentSeq")
+        reasons_raw = payload.get("reasons")
+        reasons: Dict[str, int] = {}
+        if isinstance(reasons_raw, dict):
+            for key, value in reasons_raw.items():
+                try:
+                    count = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if count <= 0:
+                    continue
+                reasons[str(key)] = count
+        reason_parts = [f"{count}文:{label}" for label, count in reasons.items()]
+        reason_summary = " / ".join(reason_parts)
+
+        self.preload_state.update(
+            {
+                "seq": seq,
+                "status": status,
+                "total": total,
+                "completed": completed,
+                "failed": failed,
+                "elapsed": elapsed_ms,
+                "allowForce": allow_force,
+                "reasons": reasons,
+            }
+        )
+
+        display_message = message
+        if status == "running":
+            self._set_start_enabled(False)
+            self._set_force_start_enabled(bool(allow_force and failed > 0))
+            if not display_message:
+                display_message = "音声準備中…"
+        elif status == "done":
+            self.preload_completed_sequences.add(seq)
+            self.preload_failed_sequences.discard(seq)
+            self._set_start_enabled(True)
+            self._set_force_start_enabled(False)
+            display_message = ""
+            logging.info(
+                "all preloaded seq=%d completed=%d failed=%d elapsed_ms=%s",
+                seq,
+                completed,
+                failed,
+                elapsed_ms,
+            )
+            self._maybe_dispatch_pending_start(seq)
+        elif status == "failed":
+            self.preload_failed_sequences.add(seq)
+            self.preload_completed_sequences.discard(seq)
+            self._set_start_enabled(False)
+            self._set_force_start_enabled(True)
+            if not display_message:
+                if reason_summary:
+                    display_message = f"一部失敗（{reason_summary}）"
+                else:
+                    display_message = f"{failed}文失敗（無音再生）" if failed else "音声生成に失敗しました"
+            self._maybe_dispatch_pending_start(seq)
+        elif status == "forced":
+            self._set_start_enabled(False)
+            self._set_force_start_enabled(False)
+            if not display_message:
+                display_message = "一部音声欠落で開始しました"
+        elif status == "cancelled":
+            self._set_start_enabled(False)
+            self._set_force_start_enabled(False)
+            if not display_message:
+                display_message = "プリロードはキャンセルされました"
+
+        preview_text = ""
+        if preview and status in {"running", "failed"}:
+            if isinstance(current_sent_seq, int) and current_sent_seq > 0:
+                preview_text = f"文{current_sent_seq}: 「{preview}」"
+            else:
+                preview_text = f"現在: 「{preview}」"
+        elif status not in {"running", "failed"}:
+            preview_text = ""
+
+        self._update_preload_display(percent, processed, total, preview_text, display_message)
+
+    def _handle_force_start_request(self, seq: Optional[int], payload: Dict[str, object]) -> None:
+        if seq is None or seq < self.active_page_seq:
+            return
+        reason = payload.get("reason") or "presenter"
+        logging.warning("force start requested from presenter seq=%d reason=%s", seq, reason)
+        self.preload_message.set("プレゼン画面から開始要求がありました")
+        self._set_force_start_enabled(True)
+
+    def _maybe_dispatch_pending_start(self, seq: int) -> None:
+        force = self.pending_start_requests.get(seq)
+        if force is None:
+            return
+        if seq not in self.ready_sequences:
+            return
+        status = str(self.preload_state.get("status", ""))
+        if not force:
+            if seq not in self.preload_completed_sequences:
+                return
+        else:
+            if status == "running":
+                return
+            if self.preload_state.get("seq") == seq:
+                self.preload_state["status"] = "forced"
+                self.preload_state["message"] = "一部音声欠落で開始しました"
+                self.preload_state["allowForce"] = False
+                completed = self.preload_state.get("completed", 0) or 0
+                failed = self.preload_state.get("failed", 0) or 0
+                total = self.preload_state.get("total", 0) or 0
+                self._update_preload_display(
+                    self.preload_progress.get(),
+                    completed + failed,
+                    total,
+                    "",
+                    "一部音声欠落で開始しました",
+                )
+        payload: Dict[str, bool] = {"force": True} if force else {}
+        self.pending_start_requests.pop(seq, None)
+        logging.info(
+            "dispatch deferred %sSTART for seq=%d",
+            "FORCE " if force else "",
+            seq,
+        )
+        self.presenter.send("START", payload, seq=seq)
+        self._set_start_enabled(False)
+        self._set_force_start_enabled(False)
 
     def _drain_ui_queue(self) -> None:
         try:
@@ -884,6 +1145,12 @@ class QuizApp:
             self._handle_presenter_ack(seq, payload if isinstance(payload, dict) else None)
         elif event == "SENTENCES_READY":
             self._handle_sentences_ready(seq, payload if isinstance(payload, dict) else None)
+        elif event == "PRELOAD_STATUS":
+            data = payload if isinstance(payload, dict) else {}
+            self._handle_preload_status(seq, data)
+        elif event == "FORCE_START_REQUEST":
+            data = payload if isinstance(payload, dict) else {}
+            self._handle_force_start_request(seq, data)
 
     def on_presentation_ready(self) -> None:
         if self.presentation_ready:
@@ -928,35 +1195,55 @@ class QuizApp:
         if seq is None:
             return
         count = payload.get("count") if isinstance(payload, dict) else None
-        logging.info("rx SENTENCES_READY seq=%d count=%s", seq, count)
+        lengths: List[int] = []
+        sentences = payload.get("sentences") if isinstance(payload, dict) else None
+        if count is not None:
+            try:
+                self._update_preload_total(seq, int(count))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(sentences, list):
+            spans: List[Tuple[int, int]] = []
+            for entry in sentences:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    start = int(entry.get("start"))
+                    end = int(entry.get("end"))
+                except (TypeError, ValueError):
+                    continue
+                if end <= start:
+                    continue
+                spans.append((start, end))
+                length = end - start
+                lengths.append(length)
+            if spans:
+                self.sequence_sentences[seq] = spans
+            elif seq in self.sequence_sentences:
+                self.sequence_sentences.pop(seq, None)
+        logging.info(
+            "rx SENTENCES_READY seq=%d count=%s lengths=%s",
+            seq,
+            count,
+            lengths if lengths else "-",
+        )
         self.awaiting_sentences.discard(seq)
         self.ready_sequences.add(seq)
-        if seq in self.pending_start_requests:
-            self.pending_start_requests.discard(seq)
-            logging.info("dispatch deferred START for seq=%d", seq)
-            self.presenter.send("START", {}, seq=seq)
+        self._maybe_dispatch_pending_start(seq)
 
     def handle_tts_request(self, payload: Dict) -> None:
         request_id = payload.get("requestId")
-        slices = payload.get("slice")
-        if not request_id or not isinstance(slices, list) or not self.current_question:
+        if not request_id or not self.current_question:
             return
         try:
             seq = int(payload.get("seq", self.page_seq))
         except (TypeError, ValueError):
             seq = self.page_seq
-        sent_seq: Optional[int] = None
+        sent_seq: Optional[int]
         try:
             sent_seq = int(payload.get("sentSeq"))  # type: ignore[arg-type]
         except (TypeError, ValueError):
-            pass
-        if sent_seq is None:
-            for item in slices:
-                try:
-                    sent_seq = int(item.get("sentSeq"))  # type: ignore[arg-type]
-                    break
-                except (TypeError, ValueError):
-                    continue
+            sent_seq = None
         if seq < self.active_page_seq:
             logging.info(
                 "drop stale job page_seq=%d sent_seq=%s (expected >=%d)",
@@ -965,7 +1252,35 @@ class QuizApp:
                 self.active_page_seq,
             )
             return
+        spans = self.sequence_sentences.get(seq)
+        start: Optional[int] = None
+        end: Optional[int] = None
+        if spans and sent_seq and 1 <= sent_seq <= len(spans):
+            start, end = spans[sent_seq - 1]
+        if (start is None or end is None) and isinstance(payload.get("startChar"), (int, str)):
+            try:
+                start = int(payload.get("startChar"))
+                end = int(payload.get("endChar"))
+            except (TypeError, ValueError):
+                start = end = None
+        if start is None or end is None or end <= start:
+            logging.info(
+                "skip TTS page_seq=%d sent_seq=%s reason=no_range", seq, sent_seq
+            )
+            response = {"requestId": request_id, "chunks": []}
+            if sent_seq is not None:
+                response["sentSeq"] = sent_seq
+            self.presenter.send("TTS_RESULT", response, seq=seq)
+            return
+
         question = self.current_question
+        total_length = len(question.display_text)
+        if start is None or end is None:
+            return
+        start = max(0, min(total_length, start))
+        end = max(start, min(total_length, end))
+        text_length = max(0, end - start)
+        mode = payload.get("mode") or "playback"
 
         with self.pending_tts_lock:
             self.pending_tts_jobs[seq] += 1
@@ -973,25 +1288,35 @@ class QuizApp:
         def worker() -> None:
             started = time.perf_counter()
             chunks: List[str] = []
-            logging.info("tts gen start page_seq=%d sent_seq=%s", seq, sent_seq)
+            logging.info(
+                "tts gen start page_seq=%d sent_seq=%s mode=%s len=%d",
+                seq,
+                sent_seq,
+                mode,
+                text_length,
+            )
             try:
-                for item in slices:
-                    start = int(item.get("startChar", 0))
-                    end = int(item.get("endChar", 0))
-                    segments = question.get_tts_segments(start, end)
-                    texts = []
-                    for text, is_kana in segments:
-                        if len(text) > MAX_CHARS_PER_TTS:
-                            for idx in range(0, len(text), MAX_CHARS_PER_TTS):
-                                texts.append((text[idx:idx + MAX_CHARS_PER_TTS], is_kana))
-                        else:
-                            texts.append((text, is_kana))
-                    for text, is_kana in texts:
-                        wav = self.tts_manager.synthesize(text, is_kana=is_kana)
-                        if wav:
-                            chunks.append(wav)
+                segments = question.get_tts_segments(start, end)
+                texts: List[Tuple[str, bool]] = []
+                for text, is_kana in segments:
+                    if len(text) > MAX_CHARS_PER_TTS:
+                        for idx in range(0, len(text), MAX_CHARS_PER_TTS):
+                            texts.append((text[idx : idx + MAX_CHARS_PER_TTS], is_kana))
+                    else:
+                        texts.append((text, is_kana))
+                for text, is_kana in texts:
+                    wav = self.tts_manager.synthesize(text, is_kana=is_kana)
+                    if wav:
+                        chunks.append(wav)
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
-                logging.info("tts gen end page_seq=%d sent_seq=%s ms=%d", seq, sent_seq, elapsed_ms)
+                logging.info(
+                    "tts gen end page_seq=%d sent_seq=%s mode=%s ms=%d chunks=%d",
+                    seq,
+                    sent_seq,
+                    mode,
+                    elapsed_ms,
+                    len(chunks),
+                )
                 if seq < self.active_page_seq:
                     logging.info(
                         "drop stale job page_seq=%d sent_seq=%s (expected >=%d)",
@@ -1066,14 +1391,58 @@ class QuizApp:
             return
         if seq not in self.ready_sequences:
             logging.info("queue START until sentences ready seq=%d", seq)
-            self.pending_start_requests.add(seq)
+            self.pending_start_requests[seq] = False
+            return
+        if seq in self.preload_failed_sequences:
+            messagebox.showwarning("音声未完了", "音声生成に失敗した文があります。「それでも開始」を押してください。")
+            return
+        if seq not in self.preload_completed_sequences:
+            logging.info("START blocked until preload complete seq=%d", seq)
+            self.preload_message.set("音声準備中です…")
             return
         self.presenter.send("START", {}, seq=seq)
+        self._set_start_enabled(False)
+        self._set_force_start_enabled(False)
 
     def stop_presentation(self, reason: str) -> None:
         if not self.presentation_ready:
             return
-        self.presenter.send("STOP_ALL", {"reason": reason}, seq=self.page_seq)
+        seq = self.page_seq
+        if seq in self.pending_start_requests:
+            logging.info("discard pending START for seq=%d due to STOP", seq)
+            self.pending_start_requests.pop(seq, None)
+        self.presenter.send("STOP_ALL", {"reason": reason}, seq=seq)
+
+    def force_start_presentation(self) -> None:
+        if not self.presentation_ready or not self.current_question:
+            messagebox.showwarning("未接続", "プレゼン画面が未接続です。")
+            return
+        seq = self.page_seq
+        if seq == 0:
+            logging.info("FORCE START requested with no active seq")
+            return
+        if seq not in self.ready_sequences:
+            logging.info("queue FORCE START until sentences ready seq=%d", seq)
+            self.pending_start_requests[seq] = True
+            return
+        logging.info("dispatch FORCE START seq=%d", seq)
+        self.presenter.send("START", {"force": True}, seq=seq)
+        self._set_start_enabled(False)
+        self._set_force_start_enabled(False)
+        if self.preload_state.get("seq") == seq:
+            self.preload_state["status"] = "forced"
+            self.preload_state["message"] = "一部音声欠落で開始しました"
+            self.preload_state["allowForce"] = False
+            completed = self.preload_state.get("completed", 0) or 0
+            failed = self.preload_state.get("failed", 0) or 0
+            total = self.preload_state.get("total", 0) or 0
+            self._update_preload_display(
+                self.preload_progress.get(),
+                completed + failed,
+                total,
+                "",
+                "一部音声欠落で開始しました",
+            )
 
     def resume_presentation(self) -> None:
         if not self.presentation_ready:
