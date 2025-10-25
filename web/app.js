@@ -1536,6 +1536,7 @@ const handlers = {
     if (!ensureSequence(data, seq)) {
       return;
     }
+    console.info(`rx resume page_seq=${state.activeSeq}`);
     const expectedSeq = state.activeSeq;
     console.info(`rx RESUME page_seq=${expectedSeq}`);
     await waitForUserReady();
